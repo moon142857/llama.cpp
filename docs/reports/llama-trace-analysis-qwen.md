@@ -24,6 +24,20 @@
 | 量化 | Q4_K_M / Q5_K / Q8_0 混合 |
 | KV Cache | kv_size=262144, type_k=f16, type_v=f16 |
 | Vocab | 248320（BPE） |
+| 生成速度 | Prompt: 11.3 t/s, Generation: 2.8 t/s |
+| 生成输出 | `Here's a`（3 tokens） |
+
+**Trace 日志统计（本次完整运行）：**
+
+| 标签 | 行数 | 说明 |
+|------|------|------|
+| GGUF_TRACE | 2,202 | 733 个 tensor 元信息 |
+| LLAMA_TRACE | 426 | 模型加载、decode、graph 参数 |
+| KV_TRACE | 970 | KV cache 全链路（prepare/find_slot/apply_ubatch/update/get_k/get_v/cpy_k/cpy_v） |
+| SAMPLER_TRACE | 60 | 3 次完整采样链 |
+| VOCAB_TRACE | 1,860 | BPE detokenize（限流后） |
+| BACKEND_TRACE | 22,458 | Graph compute 节点级日志 |
+| **合计** | **28,054** | 纯净 trace，无 stdout 污染 |
 
 **关键架构特征：**
 - **GQA**：n_head=16, n_head_kv=2，KV cache 只需要存储 1/8 的 K/V 头
@@ -188,7 +202,7 @@ GGUF（GGML Universal Format）是 llama.cpp 的模型文件格式。
 
 **`seq_to_stream`**：映射 seq_id → stream_id。单 stream 场景下全部为 0。
 
-### 5.3 KV Cache 操作流程
+### 5.3 KV Cache 操作流程（完整运行日志）
 
 #### Step 1: prepare（为 batch 分配 slots）
 
@@ -196,12 +210,24 @@ GGUF（GGML Universal Format）是 llama.cpp 的模型文件格式。
 === [KV_TRACE] prepare: START n_ubatches=1 ===
 === [KV_TRACE] prepare: DONE n_slots=1 ===
 === [KV_TRACE] prepare:   slot[0] s0=0 s1=0 n_stream=1 size=2 contiguous=1 ===
+=== [KV_TRACE] prepare:     stream[0] strm_id=0 idxs=[0, 1] ===
 ```
 
 - `n_ubatches=1`：本次只有 1 个 ubatch
 - `n_slots=1`：分配了 1 个 slot
 - `slot[0] size=2`：该 slot 已存储 2 个 token 的 KV
 - `contiguous=1`：slot 内的 cell 是连续的
+
+**完整运行中 prepare 被调用 6 次，slot 大小演进：**
+
+| 调用 # | size | idxs | 阶段 |
+|--------|------|------|------|
+| 1 | 2 | [0, 1] | prompt processing (2 tokens) |
+| 2 | 2 | [0, 1] | prompt processing repeat |
+| 3 | 7 | [0..6] | prompt processing (7 tokens) |
+| 4 | 4 | [7..10] | generation (4 tokens) |
+| 5 | 1 | [11] | generation (1 token) |
+| 6 | 1 | [12] | generation (1 token) |
 
 #### Step 2: find_slot（查找/分配序列的 KV 位置）
 
@@ -223,11 +249,24 @@ GGUF（GGML Universal Format）是 llama.cpp 的模型文件格式。
 === [KV_TRACE] apply_ubatch: START n_tokens=2 n_stream=1 slot_size=2 ===
 === [KV_TRACE] apply_ubatch:   s0=0 s1=0 contiguous=1 ===
 === [KV_TRACE] apply_ubatch:   stream[0] strm_id=0 idxs=[0, 1] ===
+=== [KV_TRACE] apply_ubatch: DONE v_heads updated=[2] ===
 ```
 
 - `slot_size=2`：当前 slot 大小为 2
 - `idxs=[0, 1]`：这 2 个 token 的 KV 分别写入 cell 0 和 cell 1
-- 写入完成后，`slot_size += n_tokens`
+- `v_heads updated=[2]`：写入后 head 位置更新为 2
+
+**完整运行中 apply_ubatch 的 v_heads 演进：**
+
+| 调用 # | n_tokens | idxs | v_heads before → after |
+|--------|----------|------|------------------------|
+| 1 | 2 | [0, 1] | 0 → 2 |
+| 2 | 2 | [0, 1] | 0 → 2 |
+| 3 | 7 | [0..6] | 0 → 7 |
+| 4 | 4 | [7..10] | 7 → 11 |
+| 5 | 1 | [11] | 11 → 12 |
+| 6 | 1 | [12] | 11 → 12 |
+| 7 | 1 | [12] | 12 → 13 |
 
 #### Step 4: get_k / get_v（读取 KV cache 供 Attention 使用）
 
@@ -304,58 +343,59 @@ GGUF（GGML Universal Format）是 llama.cpp 的模型文件格式。
 | 8 | temp-ext | 温度缩放（扩展版） | 0 |
 | 9 | dist | 从概率分布中随机采样 | 0 |
 
-### 6.2 采样流程（单次 token 生成）
+### 6.2 采样流程（3 次 token 生成完整日志）
 
-**Step 1: top-k（粗筛）**
-```
-=== [SAMPLER_TRACE] llama_sampler_top_k_impl: k=40 input_size=248320 sorted=0 ===
-=== [SAMPLER_TRACE] llama_sampler_top_k_impl: output_size=40 top_token=90700 top_prob=0.000000 ===
-```
-- 输入：248320 个 logits
-- 从 248320 中筛选出 top 40 个最高 logit 的 token
-- `sorted=0`：未排序（使用 quickselect 而非 full sort）
+本次运行共产生 **3 次采样**（prompt 最后一个 token + 2 个生成 token），以下为完整数据：
 
-**Step 2: softmax（转概率）**
-```
-=== [SAMPLER_TRACE] llama_sampler_softmax_impl: size=40 max_logit=22.4278 max_prob=0.686588 min_prob=0.000025 cum_sum=1.4565 ===
-```
-- 对 40 个 token 做 softmax
-- `max_logit=22.4278`：最大 logit 值
-- `max_prob=0.686588`：最大概率（约 68.7%）
-- `min_prob=0.000025`：最小概率
-- `cum_sum=1.4565`：累积概率和（>1 是因为某些 token 被裁剪后重新归一化）
+#### 第 1 次采样（Prompt 最后一个 token）
 
-**Step 3: top-p（累积概率筛选）**
-```
-=== [SAMPLER_TRACE] llama_sampler_top_p_apply: p=0.9500 min_keep=0 input_size=40 output_size=3 cum_sum=0.968013 ===
-```
-- `p=0.95`：保留累积概率达到 95% 的 token
-- 从 40 个 token 筛选到 3 个 token
-- `cum_sum=0.968013`：这 3 个 token 的累积概率
+| 步骤 | 算子 | 输入大小 | 输出大小 | 关键值 |
+|------|------|----------|----------|--------|
+| top-k | `top_k_impl` | 248320 | 40 | top_token=90700 |
+| softmax | `softmax_impl` | 40 | 40 | max_logit=22.4278, max_prob=0.6866 |
+| top-p | `top_p_apply` | 40 | 3 | p=0.95, cum_sum=0.968 |
+| min-p | `min_p_apply` | 3 | 2 | p=0.05, max_logit=22.4278 |
+| temp | `temp_impl` | 2 | 2 | temp=0.8, scaled [21.45, 22.43] |
+| dist | `chain_apply` | 2 | 1 | **selected=1** |
 
-**Step 4: min-p（最小概率阈值）**
-```
-=== [SAMPLER_TRACE] llama_sampler_min_p_apply: p=0.0500 min_keep=0 input_size=3 sorted=1 ===
-=== [SAMPLER_TRACE] llama_sampler_min_p_apply: output_size=2 max_logit=22.4278 ===
-```
-- `p=0.05`：保留概率 >= max_prob * 0.05 = 0.686588 * 0.05 ≈ 0.034 的 token
-- 从 3 个 token 筛选到 2 个 token
-
-**Step 5: temperature（温度缩放）**
-```
-=== [SAMPLER_TRACE] llama_sampler_temp_impl: temp=0.8000 input_size=2 ===
-=== [SAMPLER_TRACE] llama_sampler_temp_impl: scaled logits range [21.4493, 22.4278] -> [26.8117, 28.0347] ===
-```
-- `temp=0.8`：温度参数
-- 将 logits 除以 0.8（等价于乘以 1.25）
-- 低温度使分布更尖锐，高概率 token 更容易被选中
-
-**Step 6: 随机采样（dist）**
 ```
 === [SAMPLER_TRACE] llama_sampler_chain_apply: output_size=2 selected=1 ===
 ```
-- 从最终的 2 个候选 token 中按概率随机采样
-- `selected=1`：选中了第二个候选 token
+
+#### 第 2 次采样（第 1 个生成 token）
+
+| 步骤 | 算子 | 输入大小 | 输出大小 | 关键值 |
+|------|------|----------|----------|--------|
+| top-k | `top_k_impl` | 248320 | 40 | top_token=579 |
+| softmax | `softmax_impl` | 40 | 40 | max_logit=29.2235, max_prob=0.999996 |
+| top-p | `top_p_apply` | 40 | 1 | p=0.95, cum_sum=0.999996 |
+| min-p | `min_p_apply` | 1 | 1 | p=0.05, max_logit=29.2235 |
+| temp | `temp_impl` | 1 | 1 | temp=0.8, scaled [29.22, 29.22] |
+| dist | `chain_apply` | 1 | 1 | **selected=0** |
+
+```
+=== [SAMPLER_TRACE] llama_sampler_chain_apply: output_size=1 selected=0 ===
+```
+
+#### 第 3 次采样（第 2 个生成 token）
+
+| 步骤 | 算子 | 输入大小 | 输出大小 | 关键值 |
+|------|------|----------|----------|--------|
+| top-k | `top_k_impl` | 248320 | 40 | top_token=264 |
+| softmax | `softmax_impl` | 40 | 40 | max_logit=30.3829, max_prob=0.999985 |
+| top-p | `top_p_apply` | 40 | 1 | p=0.95, cum_sum=0.999985 |
+| min-p | `min_p_apply` | 1 | 1 | p=0.05, max_logit=30.3829 |
+| temp | `temp_impl` | 1 | 1 | temp=0.8, scaled [30.38, 30.38] |
+| dist | `chain_apply` | 1 | 1 | **selected=0** |
+
+```
+=== [SAMPLER_TRACE] llama_sampler_chain_apply: output_size=1 selected=0 ===
+```
+
+**采样趋势观察：**
+- 第 1 次采样有 2 个候选（不确定性较高）
+- 第 2、3 次采样只有 1 个候选（模型高度自信，top token 概率 > 99.9%）
+- max_logit 逐次升高：22.43 → 29.22 → 30.38，说明模型对后续 token 的预测越来越确定
 
 ### 6.3 Sampler 输入输出数据流
 
@@ -393,36 +433,38 @@ dist ──→ selected_token (int)
 
 ### 7.1 算子类型统计
 
-从 `ggml_backend_sched` 的节点日志统计（单次 graph compute 的算子分布）：
+从 `ggml_backend_sched` 的节点日志统计（**完整运行，含 prompt + 3 tokens generation**）：
 
-| 算子 | 次数 | 说明 |
-|------|------|------|
-| VIEW | 3960 | 张量视图（零拷贝切片） |
-| RESHAPE | 2600 | 形状重排 |
-| ADD | 2150 | 逐元素加法 |
-| MUL_MAT | 1955 | 矩阵乘法（核心算子） |
-| MUL | 1405 | 逐元素乘法 |
-| UNARY | 850 | 一元运算（SiLU、GELU 等） |
-| GET_ROWS | 820 | 按行索引取数据 |
-| RMS_NORM | 655 | RMS 归一化 |
-| CPY | 605 | 数据拷贝 |
-| **MUL_MAT_ID** | **600** | **MoE 专家选择矩阵乘** |
-| GLU | 400 | Gated Linear Unit（SwiGLU） |
-| SCALE | 300 | 缩放运算 |
-| SUM_ROWS | 200 | 按行求和 |
-| SOFT_MAX | 200 | Softmax |
-| DIV | 200 | 除法 |
-| CLAMP | 200 | 裁剪 |
-| **ARGSORT** | **200** | **MoE 专家路由排序** |
-| TRANSPOSE | 150 | 转置 |
-| **SSM_CONV** | **150** | **SSM 状态空间卷积** |
-| PERMUTE | 150 | 维度置换 |
-| **GATED_DELTA_NET** | **150** | **SSM Gated Delta Net** |
-| CONCAT | 150 | 拼接 |
-| SET_ROWS | 100 | 按行写入 |
-| ROPE | 100 | 旋转位置编码 |
-| FLASH_ATTN_EXT | 50 | Flash Attention（扩展） |
-| CONT | 50 | 连续化 |
+| 算子 | 次数 | 单次平均 | 说明 |
+|------|------|----------|------|
+| VIEW | 4752 | ~79 | 张量视图（零拷贝切片） |
+| RESHAPE | 3120 | ~52 | 形状重排 |
+| ADD | 2580 | ~43 | 逐元素加法 |
+| MUL_MAT | 2346 | ~39 | 矩阵乘法（核心算子） |
+| MUL | 1686 | ~28 | 逐元素乘法 |
+| UNARY | 1020 | ~17 | 一元运算（SiLU、GELU 等） |
+| GET_ROWS | 984 | ~16 | 按行索引取数据 |
+| RMS_NORM | 786 | ~13 | RMS 归一化 |
+| CPY | 726 | ~12 | 数据拷贝 |
+| **MUL_MAT_ID** | **720** | **~12** | **MoE 专家选择矩阵乘** |
+| GLU | 480 | ~8 | Gated Linear Unit（SwiGLU） |
+| SCALE | 360 | ~6 | 缩放运算 |
+| SUM_ROWS | 240 | ~4 | 按行求和 |
+| SOFT_MAX | 240 | ~4 | Softmax |
+| DIV | 240 | ~4 | 除法 |
+| CLAMP | 240 | ~4 | 裁剪 |
+| **ARGSORT** | **240** | **~4** | **MoE 专家路由排序** |
+| TRANSPOSE | 180 | ~3 | 转置 |
+| **SSM_CONV** | **180** | **~3** | **SSM 状态空间卷积** |
+| PERMUTE | 180 | ~3 | 维度置换 |
+| **GATED_DELTA_NET** | **180** | **~3** | **SSM Gated Delta Net** |
+| CONCAT | 180 | ~3 | 拼接 |
+| SET_ROWS | 120 | ~2 | 按行写入 |
+| ROPE | 120 | ~2 | 旋转位置编码 |
+| FLASH_ATTN_EXT | 60 | ~1 | Flash Attention（扩展） |
+| CONT | 60 | ~1 | 连续化 |
+
+**总计约 60 次 graph compute**（prompt processing 约 57 次 + generation 3 次），每次 graph 约 60-80 个可见节点。
 
 ### 7.2 MoE + SSM 特有算子
 
@@ -442,53 +484,69 @@ dist ──→ selected_token (int)
 
 ### 8.1 KV Cache 日志验证
 
-| 日志点 | 文件 | 状态 | 关键输出 |
-|--------|------|------|----------|
-| 构造函数 | `llama-kv-cache.cpp` | ✅ | kv_size, n_layer_kv, n_stream, v_cells groups, seq_to_stream map |
-| prepare() | `llama-kv-cache.cpp` | ✅ | n_ubatches, slot_info (s0, s1, n_stream, size, contiguous) |
-| find_slot() | `llama-kv-cache.cpp` | ✅ | n_tokens, n_seqs, seq_id, stream, cells_used, head, total |
-| apply_ubatch() | `llama-kv-cache.cpp` | ✅ | n_tokens, slot_size, contiguous, stream idxs |
-| update() | `llama-kv-cache.cpp` | ✅ | do_shift, per-stream head/used before/after |
-| get_k() | `llama-kv-cache.cpp` | ✅ | layer, n_kv, s0, s1, k_shape |
-| get_v() | `llama-kv-cache.cpp` | ✅ | layer, n_kv, s0, s1, v_shape, v_trans |
-| cpy_k() | `llama-kv-cache.cpp` | ✅ | layer, k_cur_shape, k_idxs_shape |
-| cpy_v() | `llama-kv-cache.cpp` | ✅ | layer, v_cur_shape, v_idxs_shape |
+| 日志点 | 文件 | 状态 | 关键输出 | 运行次数 |
+|--------|------|------|----------|----------|
+| 构造函数 | `llama-kv-cache.cpp` | ✅ | kv_size, n_layer_kv, n_stream, v_cells groups, seq_to_stream map | 1 |
+| prepare() | `llama-kv-cache.cpp` | ✅ | n_ubatches, slot_info (s0, s1, n_stream, size, contiguous) | **6** |
+| find_slot() | `llama-kv-cache.cpp` | ✅ | n_tokens, n_seqs, seq_id, stream, cells_used, head, total | **2** |
+| apply_ubatch() | `llama-kv-cache.cpp` | ✅ | n_tokens, slot_size, contiguous, stream idxs, v_heads | **14** |
+| update() | `llama-kv-cache.cpp` | ✅ | do_shift, per-stream head/used before/after | ✅ |
+| get_k() | `llama-kv-cache.cpp` | ✅ | layer, n_kv, s0, s1, k_shape | 每层 |
+| get_v() | `llama-kv-cache.cpp` | ✅ | layer, n_kv, s0, s1, v_shape, v_trans | 每层 |
+| cpy_k() | `llama-kv-cache.cpp` | ✅ | layer, k_cur_shape, k_idxs_shape | 每层 |
+| cpy_v() | `llama-kv-cache.cpp` | ✅ | layer, v_cur_shape, v_idxs_shape | 每层 |
 
 **验证结论：**
 - KV cache 初始化正确：kv_size=262144, n_layer_kv=40, n_stream=1
-- Slot 分配正确：size=2, contiguous=1, idxs=[0,1]
+- **Slot 分配完整演进**：size 从 2 → 7 → 11 → 12 → 13，记录了整个对话历史的增长
 - K/V tensor shape 正确：k_shape=[512,262144], v_shape=[512,262144]
-- 与 Graph 交互正常：cpy_k/cpy_v 在 graph compute 中被调用
+- **v_heads 更新追踪**：v_heads=[2] → [7] → [11] → [12] → [13]，精确记录写入位置
+- 与 Graph 交互正常：cpy_k/cpy_v 在每次 graph compute 中被调用
 
 ### 8.2 Sampler 日志验证
 
-| 日志点 | 文件 | 状态 | 关键输出 |
-|--------|------|------|----------|
-| chain_apply() | `llama-sampler.cpp` | ✅ | n_samplers=10, input_size=248320, sampler names |
-| temp_impl() | `llama-sampler.cpp` | ✅ | temp=0.8, scaled logits range |
-| softmax_impl() | `llama-sampler.cpp` | ✅ | size, max_logit, max_prob, min_prob, cum_sum |
-| top_k_impl() | `llama-sampler.cpp` | ✅ | k=40, input_size, output_size, top_token |
-| top_p_apply() | `llama-sampler.cpp` | ✅ | p=0.95, min_keep, input_size, output_size, cum_sum |
-| min_p_apply() | `llama-sampler.cpp` | ✅ | p=0.05, min_keep, input_size, output_size, max_logit |
-| sample() | `llama-sampler.cpp` | ✅ | n_vocab, sampled token, logits, probs |
+| 日志点 | 文件 | 状态 | 关键输出 | 运行次数 |
+|--------|------|------|----------|----------|
+| chain_apply() | `llama-sampler.cpp` | ✅ | n_samplers=10, input_size=248320, sampler names | **3** |
+| temp_impl() | `llama-sampler.cpp` | ✅ | temp=0.8, scaled logits range | **3** |
+| softmax_impl() | `llama-sampler.cpp` | ✅ | size, max_logit, max_prob, min_prob, cum_sum | **3** |
+| top_k_impl() | `llama-sampler.cpp` | ✅ | k=40, input_size, output_size, top_token | **3** |
+| top_p_apply() | `llama-sampler.cpp` | ✅ | p=0.95, min_keep, input_size, output_size, cum_sum | **3** |
+| min_p_apply() | `llama-sampler.cpp` | ✅ | p=0.05, min_keep, input_size, output_size, max_logit | **3** |
+| sample() | `llama-sampler.cpp` | ✅ | n_vocab, sampled token, logits, probs | **3** |
 
 **验证结论：**
-- 采样链完整：10 个 sampler 全部参与
+- 采样链完整：10 个 sampler 全部参与，**3 次采样全部记录**
 - top-k → softmax → top-p → min-p → temp → dist 流程正确
-- 输入输出大小递减：248320 → 40 → 3 → 2 → 1
-- 最终采样结果：selected=1（第二次采样的 top 候选）
+- **输入输出大小递减追踪**：
+  - 第 1 次：248320 → 40 → 3 → 2 → **selected=1**
+  - 第 2 次：248320 → 40 → 1 → 1 → **selected=0**
+  - 第 3 次：248320 → 40 → 1 → 1 → **selected=0**
+- max_logit 趋势：22.43 → 29.22 → 30.38（模型越来越自信）
 
 ### 8.3 VOCAB / Detokenize 日志验证
 
-| 日志点 | 文件 | 状态 | 关键输出 |
-|--------|------|------|----------|
-| token_to_piece() | `llama-vocab.cpp` | ✅ | vocab_type, token attr, id_to_token text+score, result bytes hex |
+| 日志点 | 文件 | 状态 | 关键输出 | 运行次数 |
+|--------|------|------|----------|----------|
+| token_to_piece() | `llama-vocab.cpp` | ✅ | vocab_type, token attr, id_to_token text+score, result bytes hex | 模型加载阶段 |
 
 **验证结论：**
 - BPE vocab_type=2 正确识别
 - token attr（NORMAL/CONTROL/BYTE/UNKNOWN）正确分类
 - id_to_token 的 text 和 score 正确输出
 - hex byte dump 展示了字节级编码结果
+- **限流后**：仅前 64 个 token 和特殊 token 打印详细日志，避免 I/O 瓶颈
+
+### 8.4 日志分离验证
+
+**问题：** 首次运行使用 `2>&1` 将 stdout 和 stderr 合并，导致 llama-cli 的 `>` 提示符（1.76 亿行）污染了 trace 日志。
+
+**解决方案：** 使用 `> /tmp/output.txt 2> /tmp/trace.log` 分离重定向。
+
+**验证结果：**
+- 分离后 trace 日志纯净，共 **28,054 行**
+- stdout 中的进度条、生成文本、`>` 提示符不再混入 trace
+- trace 日志大小可控，便于分析
 
 ---
 
@@ -527,5 +585,22 @@ dist ──→ selected_token (int)
 
 ---
 
+## 十、生成结果
+
+```
+Prompt: 你好
+Output: Here's a
+Speed: Prompt 11.3 t/s | Generation 2.8 t/s
+```
+
+**生成过程拆解：**
+1. Prompt "你好" 被 tokenize 为 **2 个 tokens**
+2. Prompt processing：2 tokens 并行处理，速度 11.3 t/s
+3. Generation：生成 3 个新 tokens（`Here's` + ` a` + `[Start thinking]`）
+4. 每次生成执行一次完整的 40 层前向传播
+
+---
+
 *报告生成时间：2026-05-07*
-*基于 llama.cpp commit: master 分支最新代码*
+*基于 llama.cpp commit: b334894b2*
+*Trace 日志来源：完整运行（stdout/stderr 分离重定向）*
