@@ -143,6 +143,8 @@ llama_kv_cache::llama_kv_cache(
         __func__, kv_size, n_layer_kv, n_stream, n_seq_max, n_pad, n_swa);
     fprintf(stderr, "=== [LLAMA_TRACE] %s:   type_k=%s type_v=%s v_trans=%d offload=%d ===\n",
         __func__, ggml_type_name(type_k), ggml_type_name(type_v), v_trans, offload);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s:   v_cells groups=%u cells_per_group=%u total_cells=%u ===\n",
+        __func__, n_stream, kv_size, n_stream * kv_size);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].resize(kv_size);
     }
@@ -156,6 +158,12 @@ llama_kv_cache::llama_kv_cache(
             seq_to_stream[s] = s;
         }
     }
+
+    fprintf(stderr, "=== [LLAMA_TRACE] %s:   seq_to_stream map (first 16): [", __func__);
+    for (uint32_t s = 0; s < std::min((uint32_t)seq_to_stream.size(), 16u); ++s) {
+        fprintf(stderr, "%u%s", seq_to_stream[s], s + 1 < std::min((uint32_t)seq_to_stream.size(), 16u) ? ", " : "");
+    }
+    fprintf(stderr, "] ===\n");
 
     // [TAG_V_CACHE_VARIABLE]
     if (v_trans && hparams.is_n_embd_v_gqa_variable()) {
@@ -680,6 +688,7 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    fprintf(stderr, "\n=== [KV_TRACE] %s: START n_ubatches=%zu ===\n", __func__, ubatches.size());
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -739,13 +748,34 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     }
 
     if (!success) {
+        fprintf(stderr, "=== [KV_TRACE] %s: FAILED to prepare slots ===\n", __func__);
         return {};
     }
 
+    fprintf(stderr, "=== [KV_TRACE] %s: DONE n_slots=%zu ===\n", __func__, res.size());
+    for (size_t i = 0; i < res.size(); ++i) {
+        const auto & sinfo = res[i];
+        fprintf(stderr, "=== [KV_TRACE] %s:   slot[%zu] s0=%u s1=%u n_stream=%zu size=%zu contiguous=%d ===\n",
+            __func__, i, sinfo.s0, sinfo.s1, sinfo.n_stream(), sinfo.size(), sinfo.is_contiguous());
+        for (size_t s = 0; s < std::min(sinfo.n_stream(), (size_t)4); ++s) {
+            fprintf(stderr, "=== [KV_TRACE] %s:     stream[%zu] strm_id=%u idxs=[", __func__, s, sinfo.strm[s]);
+            for (size_t j = 0; j < std::min(sinfo.idxs[s].size(), (size_t)8); ++j) {
+                fprintf(stderr, "%u%s", sinfo.idxs[s][j], j + 1 < std::min(sinfo.idxs[s].size(), (size_t)8) ? ", " : "");
+            }
+            if (sinfo.idxs[s].size() > 8) fprintf(stderr, " ... (%zu more)", sinfo.idxs[s].size() - 8);
+            fprintf(stderr, "] ===\n");
+        }
+    }
     return res;
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
+    fprintf(stderr, "\n=== [KV_TRACE] %s: START do_shift=%d sc_info.empty=%d n_stream=%u ===\n",
+        __func__, do_shift, sc_info.empty(), n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        fprintf(stderr, "=== [KV_TRACE] %s:   stream[%u] head=%u used=%u ===\n",
+            __func__, s, v_heads[s], v_cells[s].get_used());
+    }
     bool updated = false;
 
     auto * sched = lctx->get_sched();
@@ -818,6 +848,11 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         }
     }
 
+    fprintf(stderr, "=== [KV_TRACE] %s: DONE updated=%d ===\n", __func__, updated);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        fprintf(stderr, "=== [KV_TRACE] %s:   stream[%u] head=%u used=%u ===\n",
+            __func__, s, v_heads[s], v_cells[s].get_used());
+    }
     return updated;
 }
 
@@ -907,6 +942,15 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     };
 
     res.resize(n_seqs);
+
+    fprintf(stderr, "=== [KV_TRACE] %s: START n_tokens=%u n_seqs=%u cont=%d ===\n", __func__, n_tokens, n_seqs, cont);
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        const auto seq_id = ubatch.seq_id_unq[s];
+        const auto stream_id = seq_to_stream[seq_id];
+        const auto & cells = v_cells[stream_id];
+        fprintf(stderr, "=== [KV_TRACE] %s:   seq[%u] seq_id=%d stream=%u cells_used=%u head=%u total=%u ===\n",
+            __func__, s, seq_id, stream_id, cells.get_used(), v_heads[stream_id], (uint32_t)cells.size());
+    }
 
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const auto seq_id = ubatch.seq_id_unq[s];
@@ -1017,11 +1061,22 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     assert(res.s1 >= res.s0);
 
+    fprintf(stderr, "=== [KV_TRACE] %s: DONE s0=%u s1=%u n_seqs=%u idxs_per_seq=%zu ===\n",
+        __func__, res.s0, res.s1, n_seqs, res.idxs[0].size());
     return res;
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
-    fprintf(stderr, "=== [KV_TRACE] %s: n_tokens=%u n_stream=%u slot_size=%zu ===\n", __func__, ubatch.n_tokens, sinfo.n_stream(), sinfo.size());
+    fprintf(stderr, "\n=== [KV_TRACE] %s: START n_tokens=%u n_stream=%u slot_size=%zu ===\n", __func__, ubatch.n_tokens, sinfo.n_stream(), sinfo.size());
+    fprintf(stderr, "=== [KV_TRACE] %s:   s0=%u s1=%u contiguous=%d ===\n", __func__, sinfo.s0, sinfo.s1, sinfo.is_contiguous());
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        fprintf(stderr, "=== [KV_TRACE] %s:   stream[%u] strm_id=%u idxs=[", __func__, s, sinfo.strm[s]);
+        for (size_t j = 0; j < std::min(sinfo.idxs[s].size(), (size_t)16); ++j) {
+            fprintf(stderr, "%u%s", sinfo.idxs[s][j], j + 1 < std::min(sinfo.idxs[s].size(), (size_t)16) ? ", " : "");
+        }
+        if (sinfo.idxs[s].size() > 16) fprintf(stderr, " ... (%zu more)", sinfo.idxs[s].size() - 16);
+        fprintf(stderr, "] ===\n");
+    }
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -1092,6 +1147,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    fprintf(stderr, "=== [KV_TRACE] %s: DONE v_heads updated=[", __func__);
+    for (uint32_t s = 0; s < std::min(sinfo.n_stream(), (size_t)4); ++s) {
+        fprintf(stderr, "%u%s", v_heads[sinfo.strm[s]], s + 1 < sinfo.n_stream() ? ", " : "");
+    }
+    fprintf(stderr, "] ===\n");
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -1154,6 +1215,10 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
+    fprintf(stderr, "=== [KV_TRACE] %s: layer=%d n_kv=%u s0=%u s1=%u k_shape=[%lld,%lld,%lld,%lld] ===\n",
+        __func__, il, n_kv, sinfo.s0, sinfo.s1,
+        (long long)k->ne[0], (long long)k->ne[1], (long long)k->ne[2], (long long)k->ne[3]);
+
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
@@ -1173,6 +1238,10 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
+
+    fprintf(stderr, "=== [KV_TRACE] %s: layer=%d n_kv=%u s0=%u s1=%u v_shape=[%lld,%lld,%lld,%lld] v_trans=%d ===\n",
+        __func__, il, n_kv, sinfo.s0, sinfo.s1,
+        (long long)v->ne[0], (long long)v->ne[1], (long long)v->ne[2], (long long)v->ne[3], v_trans);
 
     const uint64_t kv_size      = get_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
@@ -1203,6 +1272,11 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
+
+    fprintf(stderr, "=== [KV_TRACE] %s: layer=%d k_cur_shape=[%lld,%lld,%lld,%lld] k_idxs_shape=[%lld,%lld,%lld,%lld] ===\n",
+        __func__, il,
+        (long long)k_cur->ne[0], (long long)k_cur->ne[1], (long long)k_cur->ne[2], (long long)k_cur->ne[3],
+        (long long)k_idxs->ne[0], (long long)k_idxs->ne[1], (long long)k_idxs->ne[2], (long long)k_idxs->ne[3]);
 
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1238,6 +1312,11 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
+
+    fprintf(stderr, "=== [KV_TRACE] %s: layer=%d v_cur_shape=[%lld,%lld,%lld,%lld] v_idxs_shape=[%lld,%lld,%lld,%lld] ===\n",
+        __func__, il,
+        (long long)v_cur->ne[0], (long long)v_cur->ne[1], (long long)v_cur->ne[2], (long long)v_cur->ne[3],
+        (long long)v_idxs->ne[0], (long long)v_idxs->ne[1], (long long)v_idxs->ne[2], (long long)v_idxs->ne[3]);
 
     const int32_t ikv = map_layer_ids.at(il);
 

@@ -3263,7 +3263,20 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
     // ref: https://github.com/ggml-org/llama.cpp/pull/7587#discussion_r1620983843
     static const int attr_special = LLAMA_TOKEN_ATTR_UNKNOWN | LLAMA_TOKEN_ATTR_CONTROL;
     const llama_token_attr attr = token_get_attr(token);
+    const bool is_special = (attr & (LLAMA_TOKEN_ATTR_UNKNOWN | LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_BYTE)) != 0;
+    // limit verbose logging to first 64 tokens and special tokens to avoid I/O bottleneck
+    const bool verbose = token < 64 || is_special;
+    if (verbose) {
+        fprintf(stderr, "=== [VOCAB_TRACE] %s: token=%d vocab_type=%d special=%d lstrip=%d ===\n",
+            __func__, token, (int)get_type(), special, lstrip);
+        fprintf(stderr, "=== [VOCAB_TRACE] %s:   attr=%s%s%s%s ===\n", __func__,
+            (attr & LLAMA_TOKEN_ATTR_UNKNOWN) ? "UNKNOWN " : "",
+            (attr & LLAMA_TOKEN_ATTR_CONTROL) ? "CONTROL " : "",
+            (attr & LLAMA_TOKEN_ATTR_NORMAL) ? "NORMAL " : "",
+            (attr & LLAMA_TOKEN_ATTR_BYTE) ? "BYTE " : "");
+    }
     if (!special && (attr & attr_special)) {
+        if (verbose) fprintf(stderr, "=== [VOCAB_TRACE] %s:   suppressed (special token, special=false) ===\n", __func__);
         return 0;
     }
 
@@ -3279,9 +3292,18 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
             size--;
         }
         if (length < (int32_t)size) {
+            if (verbose) fprintf(stderr, "=== [VOCAB_TRACE] %s:   result=-%zu (buffer too small, need %zu have %d) ===\n", __func__, size, size, length);
             return -(int32_t) size;
         }
         memcpy(buf, token, size);
+        if (verbose) {
+            fprintf(stderr, "=== [VOCAB_TRACE] %s:   result=%zu bytes bytes=[", __func__, size);
+            for (size_t i = 0; i < std::min(size, (size_t)16); ++i) {
+                fprintf(stderr, "%02x%s", (unsigned char)buf[i], i + 1 < std::min(size, (size_t)16) ? " " : "");
+            }
+            if (size > 16) fprintf(stderr, " ...");
+            fprintf(stderr, "] ===\n");
+        }
         return (int32_t) size;
     };
 
@@ -3295,8 +3317,10 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
         }
     }
 
+    int32_t res = 0;
     if (0 <= token && token < (int32_t) id_to_token.size()) {
         const std::string & token_text = id_to_token[token].text;
+        if (verbose) fprintf(stderr, "=== [VOCAB_TRACE] %s:   id_to_token text='%s' score=%.4f ===\n", __func__, token_text.c_str(), id_to_token[token].score);
         switch (get_type()) {
             case LLAMA_VOCAB_TYPE_WPM:
             case LLAMA_VOCAB_TYPE_SPM:
@@ -3373,6 +3397,7 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
         }
     }
 
+    fprintf(stderr, "=== [VOCAB_TRACE] %s:   result=0 (token not found or unhandled) ===\n", __func__);
     return 0;
 }
 

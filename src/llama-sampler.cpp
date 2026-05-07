@@ -263,6 +263,7 @@ static void llama_log_softmax(float * array, size_t size) {
 */
 
 static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) {
+    fprintf(stderr, "=== [SAMPLER_TRACE] %s: temp=%.4f input_size=%zu ===\n", __func__, temp, cur_p->size);
     if (temp <= 0.0f) {
         // find the token with the highest logit and set the rest to -inf
         size_t max_i = 0;
@@ -277,13 +278,19 @@ static void llama_sampler_temp_impl(llama_token_data_array * cur_p, float temp) 
                 cur_p->data[i].logit = -INFINITY;
             }
         }
-
+        fprintf(stderr, "=== [SAMPLER_TRACE] %s: greedy selected token=%d logit=%.4f ===\n", __func__, cur_p->data[max_i].id, max_l);
         return;
     }
 
+    float min_logit = cur_p->data[0].logit;
+    float max_logit = cur_p->data[0].logit;
     for (size_t i = 0; i < cur_p->size; ++i) {
+        min_logit = std::min(min_logit, cur_p->data[i].logit);
+        max_logit = std::max(max_logit, cur_p->data[i].logit);
         cur_p->data[i].logit /= temp;
     }
+    fprintf(stderr, "=== [SAMPLER_TRACE] %s: scaled logits range [%.4f, %.4f] -> [%.4f, %.4f] ===\n",
+        __func__, min_logit, max_logit, min_logit / temp, max_logit / temp);
 }
 
 static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_sort) {
@@ -312,6 +319,15 @@ static void llama_sampler_softmax_impl(llama_token_data_array * cur_p, bool do_s
     for (size_t i = 0; i < cur_p->size; ++i) {
         cur_p->data[i].p /= cum_sum;
     }
+
+    float max_prob = cur_p->data[0].p;
+    float min_prob = cur_p->data[0].p;
+    for (size_t i = 1; i < cur_p->size; ++i) {
+        max_prob = std::max(max_prob, cur_p->data[i].p);
+        min_prob = std::min(min_prob, cur_p->data[i].p);
+    }
+    fprintf(stderr, "=== [SAMPLER_TRACE] %s: size=%zu max_logit=%.4f max_prob=%.6f min_prob=%.6f cum_sum=%.4f ===\n",
+        __func__, cur_p->size, max_l, max_prob, min_prob, cum_sum);
 }
 
 static void llama_sampler_top_k_impl(llama_token_data_array * cur_p, int32_t k) {
@@ -325,12 +341,17 @@ static void llama_sampler_top_k_impl(llama_token_data_array * cur_p, int32_t k) 
 
     k = std::min(k, (int) cur_p->size);
 
+    fprintf(stderr, "=== [SAMPLER_TRACE] %s: k=%d input_size=%zu sorted=%d ===\n", __func__, k, cur_p->size, cur_p->sorted);
+
     // Sort scores in descending order
     if (!cur_p->sorted) {
         llama_token_data_array_partial_sort_inplace(cur_p, k);
     }
 
     cur_p->size = k;
+
+    fprintf(stderr, "=== [SAMPLER_TRACE] %s: output_size=%zu top_token=%d top_prob=%.6f ===\n",
+        __func__, cur_p->size, cur_p->data[0].id, cur_p->data[0].p);
 }
 
 static uint32_t get_rng_seed(uint32_t seed) {
@@ -644,6 +665,13 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
 
     time_meas tm(chain->t_sample_us, chain->params.no_perf);
 
+    fprintf(stderr, "\n=== [SAMPLER_TRACE] %s: chain n_samplers=%zu input_size=%zu ===\n",
+        __func__, chain->samplers.size(), cur_p->size);
+    for (size_t i = 0; i < chain->samplers.size(); ++i) {
+        fprintf(stderr, "=== [SAMPLER_TRACE] %s:   sampler[%zu] name=%s is_backend=%d ===\n",
+            __func__, i, llama_sampler_name(chain->samplers[i].ptr), chain->samplers[i].is_backend);
+    }
+
     bool is_backend = chain->is_init;
 
     for (auto & smpl : chain->samplers) {
@@ -659,6 +687,9 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
 
         llama_sampler_apply(smpl.ptr, cur_p);
     }
+
+    fprintf(stderr, "=== [SAMPLER_TRACE] %s: output_size=%zu selected=%d ===\n",
+        __func__, cur_p->size, cur_p->selected);
 }
 
 static void llama_sampler_chain_reset(struct llama_sampler * smpl) {
@@ -821,6 +852,9 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
+
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: n_vocab=%d sampled_logits=%p sampled_probs=%p ===\n",
+        __func__, n_vocab, (void*)sampled_logits, (void*)sampled_probs);
 
     // use pre-allocated buffer from chain if available, otherwise allocate locally
     std::vector<llama_token_data> * cur_ptr;
@@ -1409,6 +1443,8 @@ static void llama_sampler_top_p_apply(struct llama_sampler * smpl, llama_token_d
     }
 
     cur_p->size = last_idx;
+    fprintf(stderr, "=== [SAMPLER_TRACE] %s: p=%.4f min_keep=%zu input_size=%zu output_size=%zu cum_sum=%.6f ===\n",
+        __func__, ctx->p, ctx->min_keep, k, last_idx, cum_sum);
 }
 
 static struct llama_sampler * llama_sampler_top_p_clone(const struct llama_sampler * smpl) {
@@ -1551,6 +1587,9 @@ static const char * llama_sampler_min_p_name(const struct llama_sampler * smpl) 
 static void llama_sampler_min_p_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
     auto * ctx = (llama_sampler_min_p *) smpl->ctx;
 
+    fprintf(stderr, "=== [SAMPLER_TRACE] %s: p=%.4f min_keep=%zu input_size=%zu sorted=%d ===\n",
+        __func__, ctx->p, ctx->min_keep, cur_p->size, cur_p->sorted);
+
     if (ctx->p <= 0.0f || !cur_p->size) {
         return;
     }
@@ -1600,6 +1639,8 @@ static void llama_sampler_min_p_apply(struct llama_sampler * smpl, llama_token_d
         // Resize the output vector to keep only the matching tokens
         cur_p->size = i;
     }
+    fprintf(stderr, "=== [SAMPLER_TRACE] %s: output_size=%zu max_logit=%.4f ===\n",
+        __func__, cur_p->size, cur_p->data[0].logit);
 }
 
 static struct llama_sampler * llama_sampler_min_p_clone(const struct llama_sampler * smpl) {
