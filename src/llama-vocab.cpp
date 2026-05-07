@@ -4077,7 +4077,10 @@ int32_t llama_tokenize(
                      int32_t   n_tokens_max,
                         bool   add_special,
                         bool   parse_special) {
-    return vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: text_len=%d add_special=%d ===\n", __func__, text_len, add_special);
+    int32_t res = vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: result=%d tokens ===\n", __func__, res);
+    return res;
 }
 
 int32_t llama_token_to_piece(
@@ -4087,7 +4090,10 @@ int32_t llama_token_to_piece(
                      int32_t   length,
                      int32_t   lstrip,
                         bool   special) {
-    return vocab->token_to_piece(token, buf, length, lstrip, special);
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: token=%d ===\n", __func__, token);
+    int32_t res = vocab->token_to_piece(token, buf, length, lstrip, special);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: result=%d ===\n", __func__, res);
+    return res;
 }
 
 int32_t llama_detokenize(

@@ -708,6 +708,7 @@ llama_memory_t llama_context::get_memory() const {
 }
 
 bool llama_context::memory_update(bool optimize) {
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: optimize=%d ===\n", __func__, optimize);
     if (!memory) {
         return false;
     }
@@ -1169,6 +1170,7 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: ubatch.n_tokens=%d ===\n", __func__, ubatch.n_tokens);
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1201,6 +1203,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: building graph ===\n", __func__);
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1211,6 +1214,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: allocating graph ===\n", __func__);
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1222,6 +1226,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: setting inputs ===\n", __func__);
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
@@ -1531,6 +1536,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: n_tokens=%d ===\n", __func__, batch_inp.n_tokens);
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
     if (!memory) {
@@ -2172,6 +2178,7 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: batched=%d ===\n", __func__, batched);
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 

@@ -1162,6 +1162,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: START ===\n", __func__);
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
@@ -1237,6 +1238,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: device assignment: n_layer=%d n_gpu_layers=%d i_gpu_start=%d ===\n", __func__, n_layer, n_gpu_layers, i_gpu_start);
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
@@ -1400,6 +1402,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: tensors created, building backend buffers... ===\n", __func__);
     ml.done_getting_tensors();
 
     // populate tensors_by_name
@@ -1413,6 +1416,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: creating backend buffers for %zu contexts ===\n", __func__, ml.ctx_map.size());
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
 
@@ -1519,11 +1523,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
 
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: backend buffers created ===\n", __func__);
     // print memory requirements per buffer type
     for (auto & [_, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf: bufs) {
             LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s: buffer %-12s size=%8.2f MiB ===\n", __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
         }
     }
 
@@ -2057,6 +2063,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 }
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: START building graph ===\n", __func__);
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
     // add on pooling layer
@@ -2072,6 +2079,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
     llm->res->set_outputs();
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: DONE graph built ===\n", __func__);
 
     return llm->res->get_gf();
 }

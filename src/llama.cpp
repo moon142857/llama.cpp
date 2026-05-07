@@ -269,11 +269,13 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: START model load ===\n", __func__);
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
             params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: GGUF parsed, creating model object ===\n", __func__);
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
@@ -298,6 +300,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         try {
             model->load_hparams(ml);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s: hyperparameters loaded ===\n", __func__);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
@@ -306,6 +309,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
         try {
             model->load_vocab(ml);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s: vocabulary loaded ===\n", __func__);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
@@ -315,13 +319,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (params.vocab_only) {
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s: DONE (vocab only) ===\n", __func__);
             return {0, model_ptr.release()};
         }
 
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: loading tensors... ===\n", __func__);
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: tensors loaded ===\n", __func__);
 
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: DONE model load ===\n", __func__);
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());

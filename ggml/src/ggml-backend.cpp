@@ -1012,6 +1012,7 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: nodes=%d leafs=%d ===\n", __func__, graph->n_nodes, graph->n_leafs);
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1487,6 +1488,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: n_nodes=%d n_leafs=%d ===\n", __func__, sched->graph.n_nodes, sched->graph.n_leafs);
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1535,11 +1537,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
     }
 
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: allocation done ===\n", __func__);
     return true;
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: n_splits=%d ===\n", __func__, sched->n_splits);
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -1674,8 +1678,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        fprintf(stderr, "=== [LLAMA_TRACE] %s:   split %d/%d backend=%s nodes=%d ===\n", __func__, split_id, sched->n_splits, ggml_backend_name(split_backend), split->graph.n_nodes);
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s:   split %d compute status=%d ===\n", __func__, split_id, ec);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1721,6 +1727,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: ALL %d splits computed OK ===\n", __func__, sched->n_splits);
     return GGML_STATUS_SUCCESS;
 }
 
