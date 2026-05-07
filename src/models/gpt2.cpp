@@ -55,7 +55,9 @@ std::unique_ptr<llm_graph_context> llama_model_gpt2::build_arch_graph(const llm_
 }
 
 llama_model_gpt2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: START GPT2 graph build, n_layer=%d ===\n", __func__, n_layer);
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: START GPT2 graph build ===\n", __func__);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s:   params: n_tokens=%d n_embd=%lld n_layer=%lld n_head=%lld n_head_kv=%lld n_embd_head=%lld n_ff=%lld ===\n",
+        __func__, ubatch.n_tokens, (long long)n_embd, (long long)n_layer, (long long)n_head, (long long)n_head_kv, (long long)hparams.n_embd_head_v(), (long long)hparams.n_ff());
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -65,7 +67,7 @@ llama_model_gpt2::graph::graph(const llama_model & model, const llm_graph_params
     ggml_tensor * inpL;
 
     inpL = build_inp_embd(model.tok_embd);
-    fprintf(stderr, "=== [LLAMA_TRACE] %s: built input embedding ===\n", __func__);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: built input embedding, shape=[%lld, %lld, %lld, %lld] ===\n", __func__, (long long)inpL->ne[0], (long long)inpL->ne[1], (long long)inpL->ne[2], (long long)inpL->ne[3]);
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -82,7 +84,7 @@ llama_model_gpt2::graph::graph(const llama_model & model, const llm_graph_params
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
-        fprintf(stderr, "=== [LLAMA_TRACE] %s: building layer %d/%d ===\n", __func__, il, n_layer);
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: building layer %d/%lld ===\n", __func__, il, (long long)n_layer);
         cur = build_norm(inpL,
                 model.layers[il].attn_norm,
                 model.layers[il].attn_norm_b,
@@ -93,12 +95,16 @@ llama_model_gpt2::graph::graph(const llama_model & model, const llm_graph_params
         {
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
-            fprintf(stderr, "=== [LLAMA_TRACE] %s:   layer %d QKV built ===\n", __func__, il);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s:   layer %d QKV built, Q=[%lld,%lld,%lld,%lld] K=[%lld,%lld,%lld,%lld] V=[%lld,%lld,%lld,%lld] ===\n",
+                __func__, il,
+                (long long)Qcur->ne[0], (long long)Qcur->ne[1], (long long)Qcur->ne[2], (long long)Qcur->ne[3],
+                (long long)Kcur->ne[0], (long long)Kcur->ne[1], (long long)Kcur->ne[2], (long long)Kcur->ne[3],
+                (long long)Vcur->ne[0], (long long)Vcur->ne[1], (long long)Vcur->ne[2], (long long)Vcur->ne[3]);
 
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
-            fprintf(stderr, "=== [LLAMA_TRACE] %s:   layer %d attention built ===\n", __func__, il);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s:   layer %d attention built, attn_scale=%.6f ===\n", __func__, il, 1.0f/sqrtf(float(n_embd_head)));
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
@@ -125,7 +131,7 @@ llama_model_gpt2::graph::graph(const llama_model & model, const llm_graph_params
                     NULL,
                     LLM_FFN_GELU, LLM_FFN_SEQ, il);
             cb(cur, "ffn_out", il);
-            fprintf(stderr, "=== [LLAMA_TRACE] %s:   layer %d FFN built ===\n", __func__, il);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s:   layer %d FFN built, ffn_out=[%lld,%lld,%lld,%lld] ===\n", __func__, il, (long long)cur->ne[0], (long long)cur->ne[1], (long long)cur->ne[2], (long long)cur->ne[3]);
         }
 
         cur = ggml_add(ctx0, cur, ffn_inp);
@@ -136,7 +142,7 @@ llama_model_gpt2::graph::graph(const llama_model & model, const llm_graph_params
         // input for next layer
         inpL = cur;
     }
-    fprintf(stderr, "=== [LLAMA_TRACE] %s: all %d layers built ===\n", __func__, n_layer);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: all %d layers built ===\n", __func__, (int)n_layer);
 
     cur = build_norm(inpL,
             model.output_norm,
@@ -150,6 +156,7 @@ llama_model_gpt2::graph::graph(const llama_model & model, const llm_graph_params
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: DONE graph built, logits=[%lld,%lld,%lld,%lld] ===\n", __func__, (long long)cur->ne[0], (long long)cur->ne[1], (long long)cur->ne[2], (long long)cur->ne[3]);
 
     ggml_build_forward_expand(gf, cur);
 }

@@ -871,7 +871,12 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
 
     llama_sampler_accept(smpl, token);
 
-    fprintf(stderr, "=== [LLAMA_TRACE] %s: sampled token=%d ===\n", __func__, token);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: sampled token=%d logits=%.4f prob=%.6f ===\n", __func__, token, cur_p.data[cur_p.selected].logit, cur_p.data[cur_p.selected].p);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s:   top candidates = [", __func__);
+    for (int i = 0; i < std::min((int)cur_p.size, 5); ++i) {
+        fprintf(stderr, "%d:%.4f%s", cur_p.data[i].id, cur_p.data[i].p, i + 1 < std::min((int)cur_p.size, 5) ? ", " : "");
+    }
+    fprintf(stderr, "] ===\n");
     return token;
 }
 

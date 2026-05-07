@@ -301,6 +301,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         try {
             model->load_hparams(ml);
             fprintf(stderr, "=== [LLAMA_TRACE] %s: hyperparameters loaded ===\n", __func__);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s:   arch=%s n_embd=%d n_layer=%d n_head=%d n_head_kv=%d n_ctx_train=%d f_norm_eps=%.6f ===\n",
+                __func__, llm_arch_name(model->arch), model->hparams.n_embd, model->hparams.n_layer,
+                model->hparams.n_head(), model->hparams.n_head_kv(), model->hparams.n_ctx_train, model->hparams.f_norm_eps);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
@@ -310,6 +313,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         try {
             model->load_vocab(ml);
             fprintf(stderr, "=== [LLAMA_TRACE] %s: vocabulary loaded ===\n", __func__);
+            fprintf(stderr, "=== [LLAMA_TRACE] %s:   vocab_size=%u BOS=%d EOS=%d EOT=%d ===\n",
+                __func__, model->vocab.n_tokens(), model->vocab.token_bos(), model->vocab.token_eos(), model->vocab.token_eot());
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }

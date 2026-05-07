@@ -4080,6 +4080,13 @@ int32_t llama_tokenize(
     fprintf(stderr, "\n=== [LLAMA_TRACE] %s: text_len=%d add_special=%d ===\n", __func__, text_len, add_special);
     int32_t res = vocab->tokenize(text, text_len, tokens, n_tokens_max, add_special, parse_special);
     fprintf(stderr, "=== [LLAMA_TRACE] %s: result=%d tokens ===\n", __func__, res);
+    if (res > 0) {
+        fprintf(stderr, "=== [LLAMA_TRACE] %s:   token IDs = [", __func__);
+        for (int i = 0; i < std::min(res, 16); ++i) {
+            fprintf(stderr, "%d%s", tokens[i], i + 1 < std::min(res, 16) ? ", " : "");
+        }
+        fprintf(stderr, "%s] ===\n", res > 16 ? ", ..." : "");
+    }
     return res;
 }
 

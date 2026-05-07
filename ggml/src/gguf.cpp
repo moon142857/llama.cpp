@@ -567,6 +567,7 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
         }
     }
 
+    fprintf(stderr, "\n=== [GGUF_TRACE] %s: reading %" PRIi64 " tensors ===\n", __func__, n_tensors);
     // read the tensor info
     for (int64_t i = 0; ok && i < n_tensors; ++i) {
         struct gguf_tensor_info info;
@@ -688,6 +689,9 @@ struct gguf_context * gguf_init_from_file_ptr(FILE * file, struct gguf_init_para
 
         // tensor data offset within buffer
         ok = ok && gr.read(info.offset);
+
+        fprintf(stderr, "=== [GGUF_TRACE] %s:   tensor %3" PRIi64 ": name=%-30s type=%-8s shape=[%6" PRIi64 ", %6" PRIi64 ", %6" PRIi64 ", %6" PRIi64 "] offset=%" PRIi64 " ===\n",
+            __func__, i, info.t.name, ggml_type_name(info.t.type), info.t.ne[0], info.t.ne[1], info.t.ne[2], info.t.ne[3], info.offset);
 
         ctx->info.push_back(info);
     }

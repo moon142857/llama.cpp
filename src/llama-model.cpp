@@ -1238,7 +1238,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    fprintf(stderr, "=== [LLAMA_TRACE] %s: device assignment: n_layer=%d n_gpu_layers=%d i_gpu_start=%d ===\n", __func__, n_layer, n_gpu_layers, i_gpu_start);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: device assignment: n_layer=%d n_gpu_layers=%d i_gpu_start=%d act_gpu_layers=%d ===\n", __func__, n_layer, n_gpu_layers, i_gpu_start, act_gpu_layers);
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
@@ -1524,6 +1524,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     fprintf(stderr, "=== [LLAMA_TRACE] %s: backend buffers created ===\n", __func__);
+    // print per-layer device assignment
+    fprintf(stderr, "=== [LLAMA_TRACE] %s: per-layer device assignment ===\n", __func__);
+    for (int il = 0; il < n_layer; ++il) {
+        fprintf(stderr, "=== [LLAMA_TRACE] %s:   layer %2d -> %s ===\n", __func__, il, ggml_backend_dev_name(pimpl->dev_layer[il].dev));
+    }
+    fprintf(stderr, "=== [LLAMA_TRACE] %s:   output  -> %s ===\n", __func__, ggml_backend_dev_name(pimpl->dev_output.dev));
     // print memory requirements per buffer type
     for (auto & [_, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf: bufs) {
@@ -2064,6 +2070,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     fprintf(stderr, "\n=== [LLAMA_TRACE] %s: START building graph ===\n", __func__);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s:   params: n_tokens=%d n_embd=%d n_layer=%d n_head=%d n_head_kv=%d n_vocab=%d ===\n",
+        __func__, params.ubatch.n_tokens, hparams.n_embd, hparams.n_layer, hparams.n_head(), hparams.n_head_kv(), vocab.n_tokens());
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
     // add on pooling layer

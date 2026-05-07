@@ -449,6 +449,12 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
+    fprintf(stderr, "=== [BACKEND_TRACE] %s: backend=%s n_nodes=%d ===\n", __func__, ggml_backend_name(backend), cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * t = cgraph->nodes[i];
+        fprintf(stderr, "=== [BACKEND_TRACE] %s:   node %3d: op=%-16s name=%-24s shape=[%5lld, %5lld, %5lld, %5lld] ===\n",
+            __func__, i, ggml_op_name(t->op), t->name, (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+    }
     return backend->iface.graph_compute(backend, cgraph);
 }
 
@@ -1679,6 +1685,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         fprintf(stderr, "=== [LLAMA_TRACE] %s:   split %d/%d backend=%s nodes=%d ===\n", __func__, split_id, sched->n_splits, ggml_backend_name(split_backend), split->graph.n_nodes);
+        if (split->graph.n_nodes <= 8) {
+            for (int n = 0; n < split->graph.n_nodes; ++n) {
+                struct ggml_tensor * t = split->graph.nodes[n];
+                fprintf(stderr, "=== [LLAMA_TRACE] %s:     node %2d: op=%-16s name=%-20s shape=[%5lld,%5lld,%5lld,%5lld] ===\n",
+                    __func__, n, ggml_op_name(t->op), t->name, (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+            }
+        }
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             fprintf(stderr, "=== [LLAMA_TRACE] %s:   split %d compute status=%d ===\n", __func__, split_id, ec);

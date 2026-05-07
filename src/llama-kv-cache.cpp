@@ -137,6 +137,12 @@ llama_kv_cache::llama_kv_cache(
     }
 
     v_cells.resize(n_stream);
+
+    fprintf(stderr, "\n=== [LLAMA_TRACE] %s: KV cache init ===\n", __func__);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s:   kv_size=%u n_layer_kv=%u n_stream=%u n_seq_max=%u n_pad=%u n_swa=%u ===\n",
+        __func__, kv_size, n_layer_kv, n_stream, n_seq_max, n_pad, n_swa);
+    fprintf(stderr, "=== [LLAMA_TRACE] %s:   type_k=%s type_v=%s v_trans=%d offload=%d ===\n",
+        __func__, ggml_type_name(type_k), ggml_type_name(type_v), v_trans, offload);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].resize(kv_size);
     }
@@ -1015,6 +1021,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    fprintf(stderr, "=== [KV_TRACE] %s: n_tokens=%u n_stream=%u slot_size=%zu ===\n", __func__, ubatch.n_tokens, sinfo.n_stream(), sinfo.size());
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];

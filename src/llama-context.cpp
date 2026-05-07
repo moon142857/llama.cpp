@@ -710,6 +710,7 @@ llama_memory_t llama_context::get_memory() const {
 bool llama_context::memory_update(bool optimize) {
     fprintf(stderr, "\n=== [LLAMA_TRACE] %s: optimize=%d ===\n", __func__, optimize);
     if (!memory) {
+        fprintf(stderr, "=== [LLAMA_TRACE] %s:   memory is NULL, skipping ===\n", __func__);
         return false;
     }
 
@@ -1185,7 +1186,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
-        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: REUSING previous graph (n_reused=%d)\n", __func__, n_reused);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
@@ -1196,6 +1197,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        fprintf(stderr, "=== [LLAMA_TRACE] %s: BUILDING new graph (cannot reuse)\n", __func__);
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1537,6 +1539,13 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch & batch_inp) {
     fprintf(stderr, "\n=== [LLAMA_TRACE] %s: n_tokens=%d ===\n", __func__, batch_inp.n_tokens);
+    if (batch_inp.token && batch_inp.n_tokens > 0) {
+        fprintf(stderr, "=== [LLAMA_TRACE] %s:   first few token IDs = [", __func__);
+        for (int i = 0; i < std::min(batch_inp.n_tokens, 8); ++i) {
+            fprintf(stderr, "%d%s", batch_inp.token[i], i + 1 < std::min(batch_inp.n_tokens, 8) ? ", " : "");
+        }
+        fprintf(stderr, "%s] ===\n", batch_inp.n_tokens > 8 ? ", ..." : "");
+    }
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
 
     if (!memory) {
@@ -1592,6 +1601,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+    fprintf(stderr, "=== [LLAMA_TRACE] %s:   n_tokens_all=%u n_outputs_all=%u n_seq_max=%u ===\n", __func__, n_tokens_all, n_outputs_all, n_seq_max);
 
     if (output_all) {
         // require that all tokens are output
