@@ -2020,3 +2020,991 @@ Token 248046:  attr=CONTROL  text='<|im_end|>'    (EOS)
 
 *附录补充时间：2026-05-08*
 *基于 Agent 搜索结果和源代码阅读*
+
+---
+
+# 附录 C：完整推理调用栈（含注释分析）
+
+> 本附录按照从 `main()` 到 token 输出的完整流程，列出每一层的函数调用栈。每个函数标注了：所在文件、行号、作用、以及调用的下一层函数。
+
+---
+
+## C.1 阶段总览：Prefill vs Decode
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         llama-cli 主程序                                 │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  Phase 1: PREFILL (Prompt Processing)                           │   │
+│  │  ─────────────────────────────────────                          │   │
+│  │  输入: 用户 prompt "你好" → 2 个 tokens                         │   │
+│  │  特点: 所有 token 并行处理，GPU compute-bound                   │   │
+│  │  输出: 最后一个 token 的 hidden state → 第一个生成 token        │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                              ↓                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  Phase 2: DECODE (Token Generation)                             │   │
+│  │  ──────────────────────────────────                             │   │
+│  │  输入: 上一个生成的 token                                       │   │
+│  │  特点: 一次只处理 1 个 token，GPU memory-bound                  │   │
+│  │  输出: 下一个 token，循环直到 EOS                               │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## C.2 调用栈：从 main() 到模型加载
+
+### ① 程序入口
+
+```
+[tools/cli/cli.cpp:345] main()
+│ 作用: 解析命令行参数，初始化模型和上下文
+│
+├─► common_params_parse()       [common/arg.cpp] — 解析 --model, --prompt 等参数
+├─► llama_backend_init()        [src/llama.cpp] — 初始化后端（Metal/CUDA/CPU）
+├─► llama_model_load()          [src/llama.cpp] — 加载 GGUF 模型文件
+│   │
+│   ├─► gguf_init_from_file()   [ggml/src/gguf.cpp] — 解析 GGUF header + metadata
+│   │   │ 数学: 读取 magic "GGUF", version, n_tensors, n_kv
+│   │
+│   ├─► llama_model_loader::init() [src/llama-model-loader.cpp] — 构建张量加载器
+│   │
+│   ├─► llama_model::load()     [src/llama-model.cpp] — 核心加载逻辑
+│   │   │
+│   │   ├─► create_tensor()     [src/llama-model.cpp] — 为每个权重创建 ggml_tensor
+│   │   │   数学: 分配内存 shape=[n_embd, n_vocab] 等
+│   │   │
+│   │   ├─► llama_model_quantize_internal() — 如需在线反量化
+│   │   │
+│   │   └─► load_tensors()      [src/llama-model.cpp] — 将权重数据从文件拷贝到内存/GPU
+│   │       数学: 量化解压: dequant(block_q4_K) → f16/f32
+│   │
+│   └─► llama_model::init()     [src/llama-model.cpp] — 模型初始化完成
+│
+├─► llama_new_context_with_model() [src/llama.cpp] — 创建推理上下文
+│   │
+│   ├─► llama_kv_cache::init()  [src/llama-kv-cache.cpp] — 初始化 KV cache
+│   │   │ 数学: 分配 K/V 张量 shape=[n_embd_gqa, kv_size, n_stream]
+│   │   │       本模型: K=[512, 262144, 1], V=[512, 262144, 1]
+│   │
+│   ├─► ggml_backend_sched_new() [ggml/src/ggml-backend.cpp] — 创建后端调度器
+│   │
+│   └─► llama_context::init()   [src/llama-context.cpp] — 上下文初始化完成
+│
+└─► 进入生成循环
+```
+
+**关键注释**：
+- `gguf_init_from_file()` 读取 GGUF 文件时，先读 header（magic/version），再读 metadata（kv pairs），最后读 tensor info（name/shape/type/offset）。真正的权重数据在 aligned data section，通过 offset 跳转读取。
+- `load_tensors()` 决定每层放在 CPU 还是 GPU。本模型 `n_gpu_layers=41`，全部 40 层 + 输出层 offload 到 Metal。
+
+---
+
+## C.3 调用栈：Prefill（Prompt Processing）
+
+### ② Tokenize
+
+```
+[common/common.cpp] llama_tokenize()
+│ 作用: 将文本字符串转换为 token ID 数组
+│
+├─► llama_tokenize_internal()   [src/llama-vocab.cpp]
+│   │
+│   ├─► tokenizer->Encode()     [src/llama-vocab.cpp] — BPE 编码
+│   │   │ 数学: 贪心最长匹配，从字符级开始合并高频 pair
+│   │   │       "你好" → [101, 102]（示例 ID）
+│   │
+│   └─► 添加特殊 token（BOS 等）
+│
+└─► 返回 token_ids: [bos_id, 101, 102]（本模型 BOS=248044）
+```
+
+### ③ 构建 Batch
+
+```
+[examples/main/main.cpp] main()
+│
+├─► llama_batch_init()          [src/llama.cpp] — 初始化 batch 结构体
+│   │ 数学: batch.n_tokens = prompt_len
+│
+├─► llama_batch_add()           [src/llama.cpp] — 将 token ID 填入 batch
+│   │ 数学: batch.token[i] = token_id, batch.pos[i] = i
+│
+└─► llama_decode(ctx, batch)    [src/llama-context.cpp:3716] — 进入 decode
+```
+
+### ④ llama_decode 内部（Prefill 核心）
+
+```
+[src/llama-context.cpp:3716] llama_decode()  (public API wrapper)
+│ 作用: 执行一次前向传播（可以处理 batch）
+│
+├─► llama_context::decode()     [src/llama-context.cpp:1540]
+│   │ 作用: 验证 batch，初始化 allocator，分割为 ubatch，循环处理
+│   │
+│   ├─► kv_self->update()       [src/llama-kv-cache.cpp] — 更新 KV cache 状态
+│   │   │ 作用: 检查是否需要 rope shift、defragment cache
+│   │
+│   ├─► memory->init_batch()    — 创建 batch 的 memory context
+│   │
+│   └─► process_ubatch()        [src/llama-context.cpp:1173]
+│       │ 作用: 核心 per-ubatch 处理。检查 graph 是否可复用，构建/分配/执行
+│       │
+│       ├─► mctx->apply()       — 应用 memory context（KV cache slot 分配）
+│       │
+│       ├─► model.build_graph() [src/llama-model.cpp:2071] — 构建 GGML 计算图
+│       │   │
+│       │   ├─► build_arch_graph() [src/models/llama.cpp:93] — 架构特定图构建器
+│       │   │   │
+│       │   │   └─► graph<embed>::graph() [src/models/llama.cpp:98]
+│       │   │       │ 作用: 构建完整 Transformer 栈（40 层循环）
+│       │   │       │
+│       │   │       ├─► build_inp_embd()  [src/llama-graph.cpp:1709]
+│       │   │       │   │ 数学: cur = token_embd.weight[token_ids] (gather rows)
+│       │   │       │   │       cur shape: [n_embd=2048, n_tokens]
+│       │   │       │
+│       │   │       ├─► build_inp_pos()   [src/llama-graph.cpp:1793]
+│       │   │       │   │ 数学: pos = [0, 1, 2, ..., n_tokens-1]
+│       │   │       │
+│       │   │       ├─► build_attn_inp()  [src/llama-graph.cpp] — attention mask
+│       │   │       │   │ 数学: causal mask (下三角)，防止看到未来 token
+│       │   │       │
+│       │   │       └─► 循环 40 层 build_layer():
+│       │   │           │
+│       │   │           ├─► build_norm()  [src/llama-graph.cpp:1033]
+│       │   │           │   │ 数学: RMSNorm(x) = x / sqrt(mean(x²) + ε)
+│       │   │           │
+│       │   │           ├─► build_qkv()   [src/llama-graph.cpp:1069]
+│       │   │           │   │ 数学: qkv = cur × wqkv.weight
+│       │   │           │   │       Q = qkv[0:2048], K = qkv[2048:2304], V = qkv[2304:2560]
+│       │   │           │
+│       │   │           ├─► build_rope()  [src/llama-graph.cpp]
+│       │   │           │   │ 数学: [x_i, x_{i+1}] 旋转 θ = pos / base^(2i/head_dim)
+│       │   │           │
+│       │   │           ├─► build_attn()  [src/llama-graph.cpp:2179]
+│       │   │           │   │ 作用: 含 KV cache 读写的 Attention
+│       │   │           │   │
+│       │   │           │   ├─► cpy_k()   [src/llama-kv-cache.cpp:1273]
+│       │   │           │   │   │ 作用: 创建 graph 节点，将 K_new 写入 cache
+│       │   │           │   │   │ 数学: K_cache[idx] = K_new
+│       │   │           │   │
+│       │   │           │   ├─► cpy_v()   [src/llama-kv-cache.cpp:1313]
+│       │   │           │   │   │ 作用: 创建 graph 节点，将 V_new 写入 cache
+│       │   │           │   │   │ 数学: V_cache[idx] = V_new
+│       │   │           │   │
+│       │   │           │   ├─► get_k()   [src/llama-kv-cache.cpp:1213]
+│       │   │           │   │   │ 作用: 创建 view，读取全部历史 K
+│       │   │           │   │   │ 数学: K_view = K_cache[0:total_tokens]
+│       │   │           │   │
+│       │   │           │   ├─► get_v()   [src/llama-kv-cache.cpp:1237]
+│       │   │           │   │   │ 作用: 创建 view，读取全部历史 V
+│       │   │           │   │   │ 数学: V_view = V_cache[0:total_tokens]
+│       │   │           │   │
+│       │   │           │   └─► build_attn_mha() [src/llama-graph.cpp:1937]
+│       │   │           │       │ 作用: 纯 MHA 计算（不碰 KV cache）
+│       │   │           │       │
+│       │   │           │       ├─► 分支 1 (Flash Attention):
+│       │   │           │       │   │ cur = ggml_flash_attn_ext(Q, K_cache, V_cache, mask, scale)
+│       │   │           │       │   │ 数学: O_i = Σ_j(softmax(Q_i·K_j^T/√dk)·V_j)
+│       │   │           │       │
+│       │   │           │       └─► 分支 2 (Standard Attention):
+│       │   │           │           │ kq = K^T × Q / √dk + mask
+│       │   │           │           │ kq = softmax(kq)
+│       │   │           │           │ cur = V × kq
+│       │   │           │
+│       │   │           ├─► build_attn_out() [src/llama-graph.cpp]
+│       │   │           │   │ 数学: cur = attention_output × attn_output.weight
+│       │   │           │   │       cur = cur + residual (残差连接)
+│       │   │           │
+│       │   │           ├─► build_norm()     [src/llama-graph.cpp] — 第二次归一化
+│       │   │           │
+│       │   │           └─► build_ffn() / build_moe_ffn() [src/llama-graph.cpp:1310]
+│       │   │               │ 本模型使用 MoE:
+│       │   │               │
+│       │   │               ├─► Gate 路由:
+│       │   │               │   │ 数学: scores = cur × ffn_gate_inp.weight
+│       │   │               │   │       scores = softmax(scores)      [n_expert=256]
+│       │   │               │   │       selected = argsort_top_k(scores, k=n_expert_used)
+│       │   │               │
+│       │   │               ├─► Expert 计算 (MUL_MAT_ID):
+│       │   │               │   │ 数学: 对每个选中的 expert e:
+│       │   │               │   │       gate_e = SiLU(cur × gate_exps[e])
+│       │   │               │   │       up_e   = cur × up_exps[e]
+│       │   │               │   │       out_e  = (gate_e ⊙ up_e) × down_exps[e]
+│       │   │               │   │       moe_out = Σ_e(weight_e × out_e)
+│       │   │               │
+│       │   │               └─► Shared Expert:
+│       │   │                   │ 数学: shexp = SwiGLU(cur, ffn_gate_shexp, ffn_up_shexp)
+│       │   │                   │       shexp = shexp × sigmoid(cur × ffn_gate_inp_shexp)
+│       │   │                   │       cur = moe_out + shexp
+│       │   │
+│       │   └─► build_output()  [src/llama-graph.cpp] — 最终输出层
+│       │       │ 数学: logits = final_norm(cur) × output.weight
+│       │       │       logits shape: [n_vocab=248320]
+│       │
+│       ├─► ggml_backend_sched_alloc_graph() [ggml/src/ggml-backend.cpp]
+│       │   │ 作用: 为 graph 中的每个 tensor 分配内存
+│       │
+│       ├─► res->set_inputs()   — 将 batch 数据拷贝到 graph 输入 tensor
+│       │
+│       └─► graph_compute()     [src/llama-context.cpp:2188]
+│           │ 作用: 设置线程池，调度后端执行
+│           │
+│           ├─► ggml_backend_sched_graph_compute_async() [ggml/src/ggml-backend.cpp:1909]
+│           │   │
+│           │   ├─► ggml_backend_sched_alloc_graph() (如需要)
+│           │   │
+│           │   └─► ggml_backend_sched_compute_splits() [ggml/src/ggml-backend.cpp:1550]
+│           │       │ 作用: 遍历 split，逐节点执行
+│           │       │
+│           │       ├─► CPU backend:   调用 ops.cpp 中的 kernel
+│           │       ├─► Metal backend: 调用 metal 内核 (如 ggml_metal_graph_compute)
+│           │       └─► CUDA backend:  调用 cuda 内核 (如 ggml_cuda_compute_forward)
+│           │
+│           └─► 执行 cpy_k/cpy_v: K_new/V_new 实际写入 KV cache 缓冲区
+│               执行 get_k/get_v: view 是 metadata，后续 matmul 直接读 cache
+│
+├─► llama_get_logits_ith()      [src/llama.cpp] — 获取输出 logits
+│   │ 数学: 返回 logits [n_vocab] 数组指针
+│
+└─► 返回: 0 (成功)
+```
+
+### ⑤ Sampler（第一次采样，得到第一个生成 token）
+
+```
+[examples/main/main.cpp] main()
+│
+├─► common_sampler_sample()     [common/sampling.cpp:537]
+│   │ 作用: 高层采样包装。同步上下文，应用 reasoning budget、grammar、采样链
+│   │
+│   ├─► llama_synchronize(ctx)  — 确保 GPU 计算完成
+│   │
+│   ├─► llama_get_sampled_token_ith() — 检查后端 sampler 是否已产出 token
+│   │
+│   ├─► gsmpl->set_logits(ctx, idx) — 将 logits 拷贝到 sampler
+│   │
+│   ├─► llama_sampler_apply(rbudget, &cur_p) — reasoning budget 采样器
+│   │
+│   ├─► llama_sampler_apply(grmr, &cur_p) — grammar 约束采样器
+│   │
+│   └─► llama_sampler_apply(chain, &cur_p) — 核心采样链
+│       │
+│       └─► llama_sampler_sample() [src/llama-sampler.cpp:837]
+│           │ 作用: 从 logits 中采样一个 token（底层入口）
+│           │
+│           ├─► 构建 llama_token_data_array [include/llama.h:208]
+│           │   │ 数学: 对每个 token_id: data[i] = {id=i, logit=logits[i], p=0}
+│           │   │       共 248320 个条目
+│           │
+│           ├─► llama_sampler_chain_apply() [src/llama-sampler.cpp:663]
+│           │   │ 作用: 依次执行 10 个 sampler
+│           │   │
+│           │   ├─► [0] penalties         — 重复惩罚
+│           │   │   │ 数学: logit[token] -= penalty_count × penalty_value
+│           │   │
+│           │   ├─► [1] dry               — DRY 重复惩罚
+│           │   │
+│           │   ├─► [2] top-n-sigma       — Top-n-sigma 采样
+│           │   │
+│           │   ├─► [3] top-k (k=40)      [src/llama-sampler.cpp:317]
+│           │   │   │ 数学: 保留 logit 最高的 40 个，其余丢弃
+│           │   │   │       用 partial_sort，O(n log k) ≈ O(248320 × log 40)
+│           │   │
+│           │   ├─► [4] typical           — Typical 采样
+│           │   │
+│           │   ├─► [5] top-p (p=0.95)    [src/llama-sampler.cpp:1390]
+│           │   │   │ 数学: 按概率降序排列，累积概率直到 ≥ 0.95
+│           │   │   │       保留这些 token，其余丢弃
+│           │   │
+│           │   ├─► [6] min-p (p=0.05)    [src/llama-sampler.cpp:1551]
+│           │   │   │ 数学: 阈值 = max_prob × 0.05
+│           │   │   │       只保留概率 ≥ 阈值的 token
+│           │   │
+│           │   ├─► [7] xtc               — XTC 采样
+│           │   │
+│           │   ├─► [8] temp-ext (temp=0.8) [src/llama-sampler.cpp:265]
+│           │   │   │ 数学: logit_i = logit_i / 0.8 = logit_i × 1.25
+│           │   │   │       温度 < 1 使分布更尖锐（更确定）
+│           │   │
+│           │   └─► [9] dist              — 随机采样
+│           │       │ 数学: 从最终概率分布中按概率随机抽取一个 token
+│           │       │       P(token_i) = exp(logit_i) / sum_j(exp(logit_j))
+│           │
+│           └─► llama_sampler_accept()    — 告知 sampler 选中的 token（更新状态）
+│
+└─► 返回: sampled_token (第一个生成 token 的 ID)
+```
+
+### ⑥ Detokenize（第一个 token）
+
+```
+[examples/main/main.cpp] main()
+│
+├─► llama_token_to_piece()        [src/llama-vocab.cpp:4118] (public API)
+│   │ 作用: 将 token ID 转换为文本片段
+│   │
+│   └─► llama_vocab::impl::token_to_piece() [src/llama-vocab.cpp:3262]
+│       │ 作用: 核心 token-to-text 转换，支持 SPM/WPM/UGM/BPE
+│       │
+│       ├─► 查 cache_token_to_piece   — 模型加载时预填充的缓存
+│       │
+│       ├─► 根据 token attr 决定处理方式:
+│       │   │ NORMAL:  直接返回 text，去除前导空格（受 lstrip 控制）
+│       │   │ CONTROL: 返回空字符串（如 BOS/EOS）
+│       │   │ BYTE:    通过 token_to_byte() 解码为原始字节
+│       │   │ UNKNOWN: 返回 UTF-8 替换字符
+│       │
+│       └─► _try_copy() — 将结果写入 buf，返回字节数
+│
+├─► llama_detokenize()            [src/llama-vocab.cpp:4131] (public API，批量反分词)
+│   │ 作用: 将 token 数组转换为文本字符串
+│   │
+│   └─► llama_vocab::impl::detokenize() [src/llama-vocab.cpp:3408]
+│       │ 作用: 遍历 token 数组，逐个调用 token_to_piece
+│       │       处理空格剥离和清理
+│       │
+│       └─► token_to_piece()        — 逐个转换
+│
+└─► 输出到屏幕
+```
+
+---
+
+## C.4 调用栈：Decode（Token Generation Loop）
+
+```
+[examples/main/main.cpp] main()
+│
+└─► while (!should_stop)          — 生成循环
+    │
+    ├─► llama_batch_init()        — 只放 1 个 token
+    │   │ 数学: batch.n_tokens = 1
+    │
+    ├─► llama_batch_add()         — 填入上一个生成的 token
+    │   │ 数学: batch.token[0] = prev_token, batch.pos[0] = current_pos
+    │
+    ├─► llama_decode(ctx, batch)  [src/llama-context.cpp:3716]
+    │   │
+    │   ├─► kv_self->prepare()    [src/llama-kv-cache.cpp] — 为 batch 分配 slot
+    │   │   │ 作用: 查找或分配连续的 KV cache cell
+    │   │
+    │   ├─► kv_self->find_slot()  [src/llama-kv-cache.cpp] — 查找可用位置
+    │   │   │ 数学: 返回 cell 索引 [head, head+1, ...]
+    │   │
+    │   ├─► llama_context::graph_build()
+    │   │   │ 与 Prefill 类似，但 n_tokens=1
+    │   │   │ 关键区别: K/V cache 通过 get_k/get_v 读取全部历史
+    │   │   │       cpy_k/cpy_v 将新 K/V 写入 cache
+    │   │   │
+    │   │   ├─► get_k()           [src/llama-kv-cache.cpp:1215]
+    │   │   │   │ 数学: 创建 view: K_cache[0:n_kv] = [512, total_tokens]
+    │   │   │
+    │   │   ├─► get_v()           [src/llama-kv-cache.cpp:1237]
+    │   │   │   │ 数学: 创建 view: V_cache[0:n_kv] = [512, total_tokens]
+    │   │   │
+    │   │   ├─► build_attn()      — Flash Attention 读取 K/V cache view
+    │   │   │   │ 数学: Q_new [128,16,1] × K_all [128,2,total_tokens]
+    │   │   │   │       → attn_scores [total_tokens, 1]
+    │   │   │   │       然后 softmax、乘 V_all
+    │   │   │
+    │   │   ├─► cpy_k()           [src/llama-kv-cache.cpp:1273]
+    │   │   │   │ 数学: K_cache[idx] = K_new  (写入新 token 的 K)
+    │   │   │
+    │   │   └─► cpy_v()           [src/llama-kv-cache.cpp:1313]
+    │   │       │ 数学: V_cache[idx] = V_new  (写入新 token 的 V)
+    │   │
+    │   ├─► ggml_backend_sched_graph_compute() — 执行图
+    │   │
+    │   └─► llama_get_logits_ith() — 获取 logits
+    │
+    ├─► common_sampler_sample()   [common/sampling.cpp:537]
+    │   │ — 采样下一个 token（同 C.3-⑤ 的完整采样链）
+    │
+    ├─► llama_token_to_piece()    [src/llama-vocab.cpp:4118]
+    │   │ — 反分词输出（同 C.3-⑥）
+    │
+    ├─► 判断是否达到 n_predict 或遇到 EOS
+    │
+    └─► 循环继续或退出
+```
+
+---
+
+## C.5 关键洞察：KV Cache — Graph 构建 vs Graph 执行
+
+agent 搜索结果揭示了一个非常重要的设计细节：
+
+### Graph 构建阶段（声明内存访问模式）
+
+在 `build_attn()` (`src/llama-graph.cpp:2179`) 中，代码**不触碰实际的 KV cache 内存**。它只创建**图节点**来表示操作：
+
+- **`cpy_k` / `cpy_v`**: 创建 `ggml_set_rows` 节点。这些节点编码了**"在哪里写"**，但此时并不执行写入。
+- **`get_k` / `get_v`**: 创建 `ggml_view_4d` 节点。这些节点编码了**"在哪里读"**，但此时并不执行读取。
+- **`build_input_k_idxs` / `build_input_v_idxs`**: 创建输入张量，执行时才会填入实际的 cell 索引。
+
+### Graph 执行阶段（实际内存操作）
+
+后端调度器按拓扑序执行图节点：
+
+- **`ggml_set_rows` (cpy_k/cpy_v)**: 后端内核将当前 token 的 K/V 张量拷贝到预分配的 KV cache 缓冲区的指定偏移位置。
+- **`ggml_view_4d` (get_k/get_v)**: 在执行时是**纯 metadata**（零开销）；后续的 `ggml_mul_mat` 或 `ggml_flash_attn_ext` 内核直接使用 view 的 stride/offset 参数从 KV cache 缓冲区读取数据。
+
+**核心设计**：
+```
+Graph 构建: 声明 "我要读/写 KV cache 的哪些位置"
+Graph 执行: 实际执行读写操作
+```
+
+这种设计让 llama.cpp 可以：
+1. **复用计算图**（Prefill 后，Decode 的图结构几乎一样，只是 n_tokens 和索引不同）
+2. **统一内存管理**（所有内存访问都在图层面声明，调度器统一分配）
+3. **跨后端兼容**（CPU/Metal/CUDA 各自实现 cpy/get 的内核，但图结构一致）
+
+---
+
+## C.6 Prefill vs Decode 的关键差异
+
+| 维度 | Prefill | Decode |
+|------|---------|--------|
+| **batch size** | n_tokens = prompt_len (如 2~7) | n_tokens = 1 |
+| **Q shape** | [head_dim, n_head, n_tokens] | [head_dim, n_head, 1] |
+| **K/V cache** | 全部新计算，写入 cache | 读取历史 + 追加 1 个新 |
+| **Attention** | Q × K_all^T，K_all 就是本次的 K | Q_new × K_all^T，K_all 来自 cache |
+| **Graph 复用** | 通常不复用（首次调用） | 经常复用（`res->can_reuse(gparams) == true`） |
+| **线程池** | `n_threads_batch`（大 batch 专用） | `n_threads`（单线程或小线程） |
+| **后端 split** | 更多 split（大 tensor） | 更少 split，通常全驻留 GPU |
+| **瓶颈** | Compute-bound（矩阵乘量大） | Memory-bound（加载权重+cache） |
+| **GPU 利用率** | 高（~90%+） | 低（~30%） |
+| **指标** | TTFT（Time To First Token） | ITL（Inter-Token Latency） |
+| **速度** | 快（11.3 t/s，并行） | 慢（2.8 t/s，串行） |
+
+---
+
+# 附录 D：每一步的数学运算详解
+
+> 结合飞书文档《LLM 推理是如何工作的》和 llama.cpp 源码，对每个步骤给出完整数学公式。
+
+---
+
+## D.1 Tokenization（BPE）
+
+**输入**: 文本字符串 `s = "Hello, world!"`
+
+**输出**: 整数数组 `token_ids = [t₁, t₂, ..., tₙ]`
+
+**算法**:
+```
+1. 将文本拆成 UTF-8 字节序列: s = [b₁, b₂, ..., bₘ]
+2. 初始化词汇表 V = 所有单个字节
+3. 重复以下步骤直到词表达到目标大小:
+   a. 统计文本中所有相邻 token pair 的出现频率
+   b. 找到最高频的 pair (a, b)
+   c. 将 (a, b) 合并为新 token ab
+   d. 将 ab 加入词表 V
+   e. 用 ab 替换文本中所有 (a, b)
+4. 编码时: 贪心地将文本拆成词表中最长的匹配片段
+```
+
+**本模型参数**:
+- 词表大小: 248320
+- BOS token: 248044
+- EOS token: 248046
+- vocab_type: BPE (type=2)
+
+---
+
+## D.2 Embedding（词嵌入）
+
+**输入**: `token_ids` 形状 `[n_tokens]`
+
+**输出**: `X` 形状 `[n_embd, n_tokens]`
+
+**数学**:
+```
+X[:, i] = token_embd.weight[:, token_ids[i]]
+```
+
+即：**查表操作**。`token_embd.weight` 是一个 `[n_embd=2048, vocab_size=248320]` 的矩阵，每列对应一个 token 的向量。
+
+**代码位置**: `src/llama-graph.cpp` build_inp()
+
+---
+
+## D.3 RMSNorm
+
+**输入**: `x ∈ R^{n_embd}`（一个 token 的 hidden state）
+
+**输出**: `y ∈ R^{n_embd}`
+
+**数学**:
+```
+RMS(x) = sqrt( (1/n_embd) * Σᵢ xᵢ² )
+yᵢ = (xᵢ / RMS(x)) * γᵢ
+```
+
+其中:
+- `ε` (eps) 是防止除零的小常数，如 1e-6
+- `γ` (gamma) 是可学习的归一化权重，`output_norm.weight`
+
+**与 LayerNorm 对比**:
+```
+LayerNorm: y = (x - mean(x)) / sqrt(var(x) + ε) * γ + β
+RMSNorm:   y = x / sqrt(mean(x²) + ε) * γ
+```
+
+RMSNorm 去掉了 `mean` 和 `bias (β)`，计算量更少，效果在 Transformer 中接近。
+
+**代码位置**: `ggml/src/ggml-cpu/ops.cpp:3723`
+
+---
+
+## D.4 QKV Projection（含 GQA）
+
+**输入**: `X ∈ R^{n_embd × n_tokens}`
+
+**输出**: `Q ∈ R^{head_dim×n_head×n_tokens}`, `K ∈ R^{head_dim×n_head_kv×n_tokens}`, `V ∈ R^{head_dim×n_head_kv×n_tokens}`
+
+**数学（融合路径）**:
+```
+QKV = W_qkv^T · X                # [n_embd_qkv, n_tokens]
+    # W_qkv shape: [n_embd, n_embd_qkv] = [2048, 2560]
+
+Q = QKV[0 : n_embd_q, :]         # [2048, n_tokens]
+K = QKV[n_embd_q : n_embd_q+n_embd_kv, :]   # [256, n_tokens]
+V = QKV[n_embd_q+n_embd_kv : , :]           # [256, n_tokens]
+
+Q = reshape(Q, [head_dim, n_head, n_tokens])       # [128, 16, n_tokens]
+K = reshape(K, [head_dim, n_head_kv, n_tokens])    # [128, 2, n_tokens]
+V = reshape(V, [head_dim, n_head_kv, n_tokens])    # [128, 2, n_tokens]
+```
+
+**本模型参数**:
+- `head_dim = 128`
+- `n_head = 16`
+- `n_head_kv = 2`（GQA，1/8 压缩）
+- `n_embd_q = 128 × 16 = 2048`
+- `n_embd_kv = 128 × 2 = 256`
+
+**代码位置**: `src/llama-graph.cpp:1076-1100`
+
+---
+
+## D.5 RoPE（旋转位置编码）
+
+**输入**: `Q` 或 `K`，形状 `[head_dim, n_head, n_tokens]`；位置索引 `pos`
+
+**输出**: 编码后的 `Q'` 或 `K'`，相同形状
+
+**数学**:
+
+对每对维度 `(2i, 2i+1)` 和位置 `m`:
+```
+θ(m, i) = m / base^(2i/head_dim)
+
+[Q_{m,2i}  ]   [cos(θ)  -sin(θ)] [Q_{m,2i}  ]
+[Q_{m,2i+1}] = [sin(θ)   cos(θ)] [Q_{m,2i+1}]
+```
+
+展开后:
+```
+Q'_{m,2i}   = Q_{m,2i}   · cos(θ) - Q_{m,2i+1} · sin(θ)
+Q'_{m,2i+1} = Q_{m,2i}   · sin(θ) + Q_{m,2i+1} · cos(θ)
+```
+
+其中:
+- `m` = token 在序列中的位置
+- `base` = 基础频率，通常为 10000.0
+- `i` = 维度对的索引
+
+**关键性质**: 两个位置 `m` 和 `n` 的内积只依赖于 `m-n`（位置差），即:
+```
+<RoPE(Q, m), RoPE(K, n)> = f(Q, K, m-n)
+```
+
+这天然编码了**相对位置信息**。
+
+**代码位置**: `ggml/src/ggml-cpu/ops.cpp:5761`
+
+---
+
+## D.6 Standard Attention
+
+**输入**: `Q ∈ R^{d_k×n_head×n_q}`, `K ∈ R^{d_k×n_head_kv×n_kv}`, `V ∈ R^{d_v×n_head_kv×n_kv}`
+
+**输出**: `O ∈ R^{d_v×n_head×n_q}`
+
+**数学**:
+```
+# 1. 计算注意力分数
+scores = Q^T · K / sqrt(d_k)       # [n_q, n_kv]
+
+# 2. 应用因果掩码 (causal mask)
+scores = scores + mask              # mask[i,j] = -∞ if j > i, else 0
+
+# 3. Softmax 归一化
+weights_{i,j} = exp(scores_{i,j}) / Σ_k exp(scores_{i,k})
+
+# 4. 加权求和
+O = V · weights^T                   # [d_v, n_head, n_q]
+```
+
+**复杂度分析**:
+- `Q^T·K`: O(n_q × n_kv × d_k)
+- `V·weights^T`: O(n_q × n_kv × d_v)
+- **总复杂度**: O(n_q × n_kv × d)
+
+对于生成阶段: `n_q = 1`, `n_kv = total_tokens`，所以复杂度为 O(n_kv × d)。
+
+**代码位置**: `src/llama-graph.cpp:1940-2002`
+
+---
+
+## D.7 Flash Attention
+
+**输入/输出**: 同 Standard Attention
+
+**数学（等价，但实现不同）**:
+
+Flash Attention 的数学结果与 Standard Attention **完全一致**，只是通过分块计算避免存储中间矩阵。
+
+```
+# 将 Q, K, V 分成小块 (tile)
+for each Q_tile in Q:
+    acc = 0
+    max_score = -inf
+    for each K_tile, V_tile in K, V:
+        S_tile = Q_tile^T · K_tile / sqrt(d_k)    # [tile_size, tile_size]
+        m_new = max(max_score, max(S_tile))        # 跟踪最大值（数值稳定性）
+        P_tile = exp(S_tile - m_new)               # 局部 softmax
+        acc = acc · exp(max_score - m_new) + V_tile · P_tile^T
+        max_score = m_new
+    O_tile = acc / Σ(P_tile)                       # 归一化
+```
+
+**关键优化**:
+- **不存储** `[n_q, n_kv]` 的注意力矩阵
+- 在 SRAM/Shared Memory 内完成 softmax 和加权求和
+- **内存复杂度**: O(n) 而非 O(n²)
+
+**代码位置**: `ggml/src/ggml-cpu/ops.cpp:8812-8891`
+
+---
+
+## D.8 MoE Routing
+
+**输入**: `x ∈ R^{n_embd}`（单个 token 的 hidden state）
+
+**输出**: `y ∈ R^{n_embd}`
+
+### Step 1: 计算路由分数
+
+```
+gate_scores = W_gate^T · x              # [n_expert=256]
+gate_probs = softmax(gate_scores)       # [256], Σ=1
+```
+
+### Step 2: Top-K 选择
+
+```
+top_k_indices = argsort_top_k(gate_probs, k=n_expert_used)   # [k]
+top_k_weights = gate_probs[top_k_indices]                    # [k]
+```
+
+### Step 3: 专家计算
+
+对每个选中的专家 `e`:
+```
+gate_e = SiLU(x · W_gate[e])            # [n_ff]
+up_e   = x · W_up[e]                     # [n_ff]
+hidden_e = gate_e ⊙ up_e                 # [n_ff]  (逐元素乘)
+out_e = hidden_e · W_down[e]             # [n_embd]
+```
+
+### Step 4: 加权聚合
+
+```
+moe_out = Σ_{i=1}^{k} (top_k_weights[i] · out_{top_k_indices[i]})
+```
+
+### Step 5: Shared Expert
+
+```
+shexp = SwiGLU(x, W_gate_shexp, W_up_shexp)     # [n_embd]
+gate_scalar = sigmoid(x · W_gate_inp_shexp)      # 标量
+shexp = shexp · gate_scalar                        # 门控缩放
+
+y = moe_out + shexp                                # 最终输出
+```
+
+**本模型参数**:
+- `n_expert = 256`
+- `n_ff_exp = 512`（每个专家的中间维度）
+- 活跃参数量 ≈ 3B（仅激活少数专家）
+- 总参数量 ≈ 35B
+
+**代码位置**: `src/llama-graph.cpp:1310-1706`
+
+---
+
+## D.9 SwiGLU
+
+**输入**: `x ∈ R^{n_embd}`
+
+**输出**: `y ∈ R^{n_embd}`
+
+**数学**:
+
+```
+# 1. Gate 投影 + 激活
+gate = SiLU(x · W_gate)          # [n_ff]
+SiLU(z) = z / (1 + exp(-z))     # Sigmoid Linear Unit
+
+# 2. Up 投影
+up = x · W_up                    # [n_ff]
+
+# 3. 门控乘法
+hidden = gate ⊙ up               # [n_ff]  (逐元素乘，Hadamard product)
+
+# 4. Down 投影
+y = hidden · W_down              # [n_embd]
+```
+
+**SiLU 函数图像**:
+- `x → +∞`: SiLU(x) ≈ x（近似线性）
+- `x → -∞`: SiLU(x) → 0（平滑趋近）
+- `x = 0`: SiLU(0) = 0
+- 导数: SiLU'(x) = SiLU(x)/x + sigmoid(x)·(1 - SiLU(x)/x)
+
+**代码位置**: `ggml/src/ggml-cpu/vec.cpp:433`
+
+---
+
+## D.10 Output Projection + Softmax
+
+### Output Projection
+
+**输入**: `x ∈ R^{n_embd}`（最后一个 layer 的输出）
+
+**输出**: `logits ∈ R^{n_vocab}`
+
+**数学**:
+```
+logits = W_output^T · RMSNorm(x)
+```
+
+其中 `W_output` 形状 `[n_embd, n_vocab] = [2048, 248320]`。
+
+### Softmax
+
+**输入**: `logits ∈ R^{n_vocab}`
+
+**输出**: `probs ∈ R^{n_vocab}`，满足 `Σ probs[i] = 1`
+
+**数学**:
+```
+logits_max = max(logits)                    # 数值稳定性
+exp_logits = exp(logits - logits_max)       # 减去最大值防止溢出
+probs = exp_logits / sum(exp_logits)
+```
+
+**代码位置**:
+- Output: `src/llama-graph.cpp` build_output()
+- Softmax: `src/llama-sampler.cpp:296`
+
+---
+
+## D.11 Sampler Chain 数学
+
+### D.11.1 Temperature
+
+**输入**: `logits ∈ R^n`
+
+**输出**: `logits' ∈ R^n`
+
+```
+logits'_i = logits_i / T
+```
+
+- `T < 1`: 分布更尖锐，更确定
+- `T > 1`: 分布更平坦，更随机
+- `T = 0`: 退化为贪心采样（等价于 argmax）
+
+本模型 `T = 0.8`。
+
+### D.11.2 Top-K
+
+**输入**: `logits ∈ R^n`
+
+**输出**: 保留 K 个最高分的 token，其余丢弃
+
+```
+indices = argsort(logits, descending=True)[0:K]
+logits' = logits[indices]
+```
+
+本模型 `K = 40`。
+
+### D.11.3 Top-P (Nucleus Sampling)
+
+**输入**: `probs ∈ R^n`（已 softmax 且降序排列）
+
+**输出**: 保留累积概率达到 P 的最小 token 集合
+
+```
+cumsum = cumulative_sum(probs)
+mask = cumsum <= P
+cutoff = sum(mask)
+probs' = probs[0:cutoff]
+```
+
+本模型 `P = 0.95`。
+
+### D.11.4 Min-P
+
+**输入**: `probs ∈ R^n`
+
+**输出**: 过滤掉低概率 token
+
+```
+max_prob = max(probs)
+threshold = max_prob × p_min
+mask = probs >= threshold
+probs' = probs[mask]
+```
+
+本模型 `p_min = 0.05`。
+
+### D.11.5 随机采样
+
+**输入**: `probs ∈ R^n`
+
+**输出**: 单个 token ID
+
+```
+r = random_uniform(0, 1)
+cumsum = 0
+for i in 0..n-1:
+    cumsum += probs[i]
+    if cumsum >= r:
+        return token_id[i]
+```
+
+**代码位置**: `src/llama-sampler.cpp`
+
+---
+
+## D.12 Quantization / Dequantization
+
+### D.12.1 q4_K 反量化
+
+**输入**: `block_q4_K`（144 bytes，代表 256 个权重）
+
+**输出**: `w ∈ R^{256}`
+
+**数学**:
+```
+# 1. 从 super-block 读取 scale 和 min
+d = float(block.d)          # super-block scale
+dmin = float(block.dmin)    # super-block min
+
+# 2. 从 scales 数组还原 8 个 block 各自的 scale 和 min
+for block_i in 0..7:
+    sc = decode_scale(block.scales, block_i)   # 6-bit 压缩
+    m = decode_min(block.scales, block_i)      # 6-bit 压缩
+
+    # 3. 还原 32 个权重
+    for j in 0..31:
+        q = block.qs[block_i * 32 + j]         # 4-bit 量化值 (0~15)
+        w[block_i * 32 + j] = d * sc * q + dmin * m
+```
+
+**等效位宽**: 144 bytes / 256 weights = 4.5 bits/weight
+
+### D.12.2 q8_0 反量化
+
+**输入**: `block_q8_0`（34 bytes，代表 32 个权重）
+
+**输出**: `w ∈ R^{32}`
+
+**数学**:
+```
+d = float(block.d)          # scale
+for j in 0..31:
+    w[j] = d * block.qs[j]  # qs[j] 是 int8 (-128~127)
+```
+
+**等效位宽**: 34 bytes / 32 weights = 8.5 bits/weight
+
+### D.12.3 量化矩阵乘法
+
+推理时权重保持量化状态，只在 kernel 内部实时反量化：
+
+```
+for each output element y[i]:
+    acc = 0
+    for each block:
+        dequantize block → w[0:32] or w[0:256]
+        acc += dot_product(x[block_start:block_end], w)
+    y[i] = acc
+```
+
+**关键洞察**: 不一次性将全部权重反量化为 f32，而是**逐 block 在寄存器中反量化**，大幅减少显存占用。
+
+**代码位置**: `ggml/src/ggml-common.h`
+
+---
+
+## D.13 KV Cache 内存计算公式
+
+### 单层的 K/V cache 大小
+
+```
+K_cache_size_per_layer = n_head_kv × head_dim × kv_size × sizeof(type_k)
+V_cache_size_per_layer = n_head_kv × head_dim × kv_size × sizeof(type_v)
+```
+
+### 本模型（40 层，FP16）
+
+```
+head_dim = 128
+n_head_kv = 2
+kv_size = 262144
+type_size = 2 bytes (f16)
+
+K_per_layer = 2 × 128 × 262144 × 2 = 134,217,728 bytes = 128 MiB
+V_per_layer = 2 × 128 × 262144 × 2 = 134,217,728 bytes = 128 MiB
+
+Total_KV = 40 × (128 + 128) = 40 × 256 = 10,240 MiB ≈ 10 GiB
+```
+
+### GQA 节省的内存
+
+如果不用 GQA（n_head_kv = n_head = 16）:
+```
+Total_KV_dense = 40 × (16 × 128 × 262144 × 2 × 2) = 80 GiB
+```
+
+GQA 节省了 **8 倍** KV cache 内存。
+
+### 量化 KV cache 后的节省
+
+如果 KV cache 量化为 q8_0:
+```
+Total_KV_q8 = 40 × (2 × 128 × 262144 × 1 × 2) ≈ 5 GiB
+```
+
+如果量化为 q4_K:
+```
+Total_KV_q4 = 40 × (2 × 128 × 262144 × 0.5 × 2) ≈ 2.5 GiB
+```
+
+**代码位置**: `src/llama-kv-cache.cpp`
+
+---
+
+*附录 C/D 补充时间：2026-05-08*
+*参考文档：《LLM 推理是如何工作的》（https://waytoagi.feishu.cn/wiki/OqmxwW9KRiplYQkt3qbcxb5Fnhh）*
+*结合 llama.cpp 源码和 Agent 搜索结果编写*
